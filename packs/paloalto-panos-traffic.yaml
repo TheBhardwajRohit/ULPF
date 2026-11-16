@@ -1,0 +1,122 @@
+# Palo Alto PAN-OS traffic log over syslog.
+#
+# PAN-OS sends a positional CSV record whose meaning is entirely by column
+# index. Field 1 is FUTURE_USE and is empty, so the record begins with a comma.
+# Positions below are 0-based (col.N = documented position - 1).
+#
+# Format reference: PAN-OS Admin Guide, "Traffic Log Fields".
+#
+# Checked against Elastic's panw integration test fixtures (real PA-220
+# device output, a genuine 2018 capture, github.com/elastic/integrations,
+# used only as a structure reference — no lines copied verbatim into this
+# pack). Every column index below — including the three-column gap between
+# Destination Zone/Interfaces and Session ID that the documentation alone
+# would be easy to miscount — landed exactly where the real device put it.
+# No changes were needed; recorded here the same way suricata-eve-alert's
+# clean real-data pass is, because a documentation-derived pack that has
+# never actually been checked against real device output is exactly the
+# failure mode this project has hit before (see docs/CAPTURING-LOGS.md).
+identity:
+  id: paloalto-panos-traffic
+  vendor: Palo Alto Networks
+  product: PAN-OS
+  log_format: syslog-csv
+  priority: 10
+  detect:
+    - contains_all: [",TRAFFIC,"]
+
+extract:
+  - decoder: syslog
+  - decoder: csv
+
+map:
+  class_uid: 4001
+  activity_id:
+    from: col.30                       # Action
+    enum: panos_action
+    default: 6
+  severity_id: 1
+  time:
+    from: col.6                        # Generated Time
+    format: slash_date_time
+  src_endpoint.ip:
+    from: col.7                        # Source Address
+    observable: ip
+  src_endpoint.port:
+    from: col.24                       # Source Port
+    as: int
+  src_endpoint.zone:
+    from: col.16                       # Source Zone
+  src_endpoint.interface_name:
+    from: col.18                       # Inbound Interface
+  dst_endpoint.ip:
+    from: col.8                        # Destination Address
+    observable: ip
+  dst_endpoint.port:
+    from: col.25                       # Destination Port
+    as: int
+  dst_endpoint.zone:
+    from: col.17                       # Destination Zone
+  dst_endpoint.interface_name:
+    from: col.19                       # Outbound Interface
+  connection_info.protocol_name:
+    from: col.29                       # IP Protocol
+  connection_info.session_uid:
+    from: col.22                       # Session ID
+  app_name:
+    from: col.14                       # Application
+  traffic.bytes:
+    from: col.31                       # Bytes
+    as: int
+  traffic.bytes_out:
+    from: col.32                       # Bytes Sent
+    as: int
+  traffic.bytes_in:
+    from: col.33                       # Bytes Received
+    as: int
+  traffic.packets:
+    from: col.34                       # Packets
+    as: int
+  actor.user.name:
+    from: col.12                       # Source User
+    observable: user
+  device.uid:
+    from: col.2                        # Serial Number
+
+enums:
+  panos_action:
+    allow: 6
+    deny: 3
+    drop: 3
+    reset-client: 3
+    reset-server: 3
+    reset-both: 3
+
+fixtures:
+  - note: Allowed DNS session at documented column positions.
+    raw: '<14>Aug 31 10:23:45 PA-3220 1,2026/08/31 10:23:45,001801234567,TRAFFIC,end,2049,2026/08/31 10:23:44,10.2.4.7,8.8.8.8,203.0.113.9,8.8.8.8,allow-dns,,,dns,vsys1,trust,untrust,ethernet1/1,ethernet1/2,log-forwarding,,12345,1,53124,53,41234,53,0x400053,udp,allow,512,64,448,4,2026/08/31 10:23:40,0,dns'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      src_endpoint.ip: 10.2.4.7
+      dst_endpoint.ip: 8.8.8.8
+      src_endpoint.port: 53124
+      dst_endpoint.port: 53
+      app_name: dns
+      traffic.bytes: 512
+      src_endpoint.zone: trust
+      dst_endpoint.zone: untrust
+
+  - note: >
+      Same column layout, freshly built to match a real PA-220's traffic-log
+      shape (see the pack header comment) rather than copied from that
+      source. ICMP session: no real ports, both port columns numeric zero.
+    raw: '<14>Nov 30 16:09:10 PA-220 1,2026/11/30 16:09:09,012801096514,TRAFFIC,end,2049,2026/11/30 16:09:09,192.168.15.224,175.16.199.1,192.168.1.63,175.16.199.1,new_outbound_from_trust,,,ping,vsys1,trust,untrust,ethernet1/2,ethernet1/1,send_to_mac,2026/11/30 16:09:09,24223,6,0,0,0,0,0x500019,icmp,allow,1176,588,588,12,2026/11/30 16:08:55,0,any,0,32091113,0x0,192.168.0.0-192.168.255.255,United States,0,6,6,aged-out,0,0,0,0,,PA-220,from-policy,,,0,,0,,N/A,0,0,0,0'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      src_endpoint.ip: 192.168.15.224
+      dst_endpoint.ip: 175.16.199.1
+      connection_info.protocol_name: icmp
+      connection_info.session_uid: "24223"
+      device.uid: "012801096514"

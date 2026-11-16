@@ -1,0 +1,204 @@
+# Cisco ASA syslog format.
+#
+# ASA logs start with `%ASA-<severity>-<message_id>: ` followed by the message.
+# We focus on the high-volume network traffic logs (302013-302016, 302018,
+# 302020-302021).
+#
+# Checked against Elastic's cisco_asa integration test fixtures (real ASA
+# device output, github.com/elastic/integrations, used only as a structure
+# reference — no lines copied verbatim into this pack). Two real findings:
+#
+# 1. ASA configured with `service timestamps log datetime year` emits
+#    `Oct 10 2018 12:34:56 <host> <tag>[<pid>]: %ASA-...` — a 20-character
+#    timestamp with the year inlined, not the 15-character RFC 3164 form. The
+#    syslog envelope decoder now accepts both (see ulpf-decode's syslog.rs);
+#    without that fix this pack's own regexes still matched the message body
+#    (they search, not anchor), but `device.hostname` silently came back
+#    empty on every line from a device configured this way.
+# 2. The enum table below claims 302020/302021 (ICMP built/teardown), but the
+#    real message shape for ICMP is entirely different from TCP/UDP — no
+#    `for outside:ip/port to inside:ip/port`, instead
+#    `for faddr ip/id gaddr ip/id laddr ip/id type N code N` — and the two
+#    TCP/UDP patterns below never matched it. Added two more patterns so the
+#    claim is actually true. 302018 (GRE teardown) was not previously claimed
+#    and is now supported too.
+identity:
+  id: cisco-asa-network
+  vendor: Cisco
+  product: ASA
+  log_format: syslog-regex
+  priority: 15
+  detect:
+    # Reliable signature for Cisco ASA logs.
+    - contains_any: ["%ASA-1-", "%ASA-2-", "%ASA-3-", "%ASA-4-", "%ASA-5-", "%ASA-6-", "%ASA-7-"]
+
+extract:
+  - decoder: syslog
+  - decoder: regex
+    patterns:
+      # Built connection: %ASA-6-302013: Built inbound TCP connection 12345678 for outside:10.1.1.1/12345 (10.1.1.1/12345) to inside:192.168.1.1/80 (192.168.1.1/80)
+      # Built connection without NAT: %ASA-6-302013: Built inbound TCP connection 12345678 for outside:10.1.1.1/12345 to inside:192.168.1.1/80
+      - '%ASA-(?P<severity>\d+)-(?P<msg_id>\d+):\s+Built\s+(?P<direction>\w+)\s+(?P<proto>\w+)\s+connection\s+(?P<session>\d+)\s+for\s+(?P<src_intf>\w+):(?P<src_ip>[\d.]+)/(?P<src_port>\d+)(?:\s+\([^)]+\))?\s+to\s+(?P<dst_intf>\w+):(?P<dst_ip>[\d.]+)/(?P<dst_port>\d+)'
+      
+      # Teardown connection: %ASA-6-302014: Teardown TCP connection 12345678 for outside:10.1.1.1/12345 to inside:192.168.1.1/80 duration 0:00:30 bytes 12345 TCP FINs
+      - '%ASA-(?P<severity>\d+)-(?P<msg_id>\d+):\s+Teardown\s+(?P<proto>\w+)\s+connection\s+(?P<session>\d+)\s+for\s+(?P<src_intf>\w+):(?P<src_ip>[\d.]+)/(?P<src_port>\d+)(?:\s+\([^)]+\))?\s+to\s+(?P<dst_intf>\w+):(?P<dst_ip>[\d.]+)/(?P<dst_port>\d+)(?:\s+\([^)]+\))?\s+duration\s+(?P<duration>[\d:]+)\s+bytes\s+(?P<bytes>\d+)'
+
+      # Built ICMP: %ASA-6-302020: Built outbound ICMP connection for faddr 2001:db8::1/0 gaddr ::ffff:10.0.0.1/0 laddr ::ffff:10.0.0.2/0 type 3 code 0
+      # ICMP has no interface-prefixed src/dst and no real port — faddr/gaddr/laddr instead — so it needs its own shape, not the TCP/UDP one above.
+      - '%ASA-(?P<severity>\d+)-(?P<msg_id>\d+):\s+Built\s+(?P<direction>\w+)\s+(?P<proto>ICMP)\s+connection\s+for\s+faddr\s+(?P<dst_ip>[0-9a-fA-F:.]+)/\d+\s+gaddr\s+[0-9a-fA-F:.]+/\d+\s+laddr\s+(?P<src_ip>[0-9a-fA-F:.]+)/\d+'
+
+      # Teardown ICMP: %ASA-6-302021: Teardown ICMP connection for faddr 2001:db8::1/9 gaddr 2001:db8::2/0 laddr 2001:db8::2/0 type 128 code 0
+      # Teardown never carries a direction word, unlike Built.
+      - '%ASA-(?P<severity>\d+)-(?P<msg_id>\d+):\s+Teardown\s+(?P<proto>ICMP)\s+connection\s+for\s+faddr\s+(?P<dst_ip>[0-9a-fA-F:.]+)/\d+\s+gaddr\s+[0-9a-fA-F:.]+/\d+\s+laddr\s+(?P<src_ip>[0-9a-fA-F:.]+)/\d+'
+
+      # Teardown GRE: %ASA-6-302018: Teardown GRE connection 472592149 from outside:81.2.69.142 to inside:89.160.20.156/0 duration 0:02:01 bytes 1344
+      - '%ASA-(?P<severity>\d+)-(?P<msg_id>\d+):\s+Teardown\s+(?P<proto>GRE)\s+connection\s+(?P<session>\d+)\s+from\s+(?P<src_intf>\w+):(?P<src_ip>[\d.]+)\s+to\s+(?P<dst_intf>\w+):(?P<dst_ip>[\d.]+)/\d+\s+duration\s+(?P<duration>[\d:]+)\s+bytes\s+(?P<bytes>\d+)'
+
+map:
+  class_uid: 4001                      # Network Activity
+  activity_id:
+    from: msg_id
+    enum: asa_activity
+    default: 99                        # Other
+  severity_id:
+    from: severity
+    enum: asa_severity
+    default: 1
+  message:
+    from: syslog.body
+  src_endpoint.ip:
+    from: src_ip
+    observable: ip
+  src_endpoint.port:
+    from: src_port
+    as: int
+  src_endpoint.interface_name:
+    from: src_intf
+  dst_endpoint.ip:
+    from: dst_ip
+    observable: ip
+  dst_endpoint.port:
+    from: dst_port
+    as: int
+  dst_endpoint.interface_name:
+    from: dst_intf
+  connection_info.protocol_name:
+    from: proto
+  connection_info.session_uid:
+    from: session
+  connection_info.direction_id:
+    from: direction
+    enum: asa_direction
+  traffic.bytes:
+    from: bytes
+    as: int
+  device.hostname:
+    from: syslog.hostname
+    observable: hostname
+
+enums:
+  asa_activity:
+    # 302013 = Built TCP, 302015 = Built UDP, 302020 = Built ICMP
+    "302013": 1 # Open
+    "302015": 1
+    "302020": 1
+    # 302014 = Teardown TCP, 302016 = Teardown UDP, 302021 = Teardown ICMP
+    "302014": 2 # Close
+    "302016": 2
+    "302021": 2
+    "302018": 2 # Teardown GRE
+  asa_severity:
+    # Syslog severity maps 0-7, OCSF 1-6
+    "0": 6 # Emergency -> Fatal
+    "1": 5 # Alert -> Critical
+    "2": 5 # Critical -> Critical
+    "3": 4 # Error -> High
+    "4": 3 # Warning -> Medium
+    "5": 2 # Notice -> Low
+    "6": 1 # Informational -> Info
+    "7": 1 # Debug -> Info
+  asa_direction:
+    "inbound": 1
+    "outbound": 2
+
+fixtures:
+  - note: TCP Connection Built (with NAT blocks in parens)
+    raw: '<166>Oct 06 15:04:12 fwv-lon-01 : %ASA-6-302013: Built outbound TCP connection 123456 for outside:192.168.1.1/80 (192.168.1.1/80) to inside:10.0.0.1/45678 (10.0.0.1/45678)'
+    expect:
+      class_uid: 4001
+      activity_id: 1
+      severity_id: 1
+      src_endpoint.ip: 192.168.1.1
+      src_endpoint.port: 80
+      src_endpoint.interface_name: outside
+      dst_endpoint.ip: 10.0.0.1
+      dst_endpoint.port: 45678
+      dst_endpoint.interface_name: inside
+      connection_info.protocol_name: TCP
+      connection_info.session_uid: "123456"
+      connection_info.direction_id: 2
+      device.hostname: fwv-lon-01
+
+  - note: UDP Connection Teardown
+    raw: '<166>Oct 06 15:05:12 fwv-lon-01 : %ASA-6-302016: Teardown UDP connection 87654321 for inside:10.0.0.2/54321 to outside:8.8.8.8/53 duration 0:00:05 bytes 500'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      severity_id: 1
+      src_endpoint.ip: 10.0.0.2
+      src_endpoint.port: 54321
+      src_endpoint.interface_name: inside
+      dst_endpoint.ip: 8.8.8.8
+      dst_endpoint.port: 53
+      dst_endpoint.interface_name: outside
+      connection_info.protocol_name: UDP
+      connection_info.session_uid: "87654321"
+      traffic.bytes: 500
+      device.hostname: fwv-lon-01
+
+  - note: >
+      Real-shape timestamp: `service timestamps log datetime year` puts the
+      year inline (20 chars), not the plain 15-char RFC 3164 stamp the other
+      fixtures use. Confirms device.hostname still comes through — this used
+      to come back empty before the syslog envelope decoder learned this form.
+    raw: '<166>Oct 10 2018 12:34:56 fwv-lon-02 CiscoASA[999]: %ASA-6-302013: Built outbound TCP connection 555 for outside:203.0.113.9/443 (203.0.113.9/443) to inside:10.0.0.5/33221 (10.0.0.5/33221)'
+    expect:
+      class_uid: 4001
+      activity_id: 1
+      src_endpoint.ip: 203.0.113.9
+      dst_endpoint.ip: 10.0.0.5
+      connection_info.session_uid: "555"
+      device.hostname: fwv-lon-02
+
+  - note: >
+      Built ICMP connection — a different message shape from TCP/UDP (no
+      interface-prefixed endpoints, faddr/gaddr/laddr instead). This message
+      ID was already in the activity enum below before this pack could
+      actually parse it.
+    raw: '<166>Oct 06 15:06:00 fwv-lon-01 : %ASA-6-302020: Built outbound ICMP connection for faddr 2001:db8::a1/0 gaddr ::ffff:198.51.100.4/0 laddr ::ffff:10.0.0.9/0 type 8 code 0'
+    expect:
+      class_uid: 4001
+      activity_id: 1
+      connection_info.protocol_name: ICMP
+      src_endpoint.ip: "::ffff:10.0.0.9"
+      dst_endpoint.ip: "2001:db8::a1"
+
+  - note: Teardown ICMP connection — same alternate shape, no direction word.
+    raw: '<166>Oct 06 15:06:05 fwv-lon-01 : %ASA-6-302021: Teardown ICMP connection for faddr 2001:db8::a1/9 gaddr 2001:db8::b2/0 laddr 2001:db8::b2/0 type 0 code 0'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      connection_info.protocol_name: ICMP
+      src_endpoint.ip: "2001:db8::b2"
+      dst_endpoint.ip: "2001:db8::a1"
+
+  - note: Teardown GRE connection (VPN/tunnel), not previously handled at all.
+    raw: '<166>Oct 06 15:06:10 fwv-lon-01 : %ASA-6-302018: Teardown GRE connection 918273645 from outside:203.0.113.20 to inside:10.0.0.7/0 duration 0:04:30 bytes 9001'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      connection_info.protocol_name: GRE
+      connection_info.session_uid: "918273645"
+      src_endpoint.ip: 203.0.113.20
+      dst_endpoint.ip: 10.0.0.7
+      traffic.bytes: 9001

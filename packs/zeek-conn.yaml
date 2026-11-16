@@ -1,0 +1,154 @@
+# Zeek (formerly Bro) conn.log — network connection summaries.
+#
+# Zeek is the most widely deployed open-source network security monitor, and
+# `conn.log` is its core record: one line per connection with both endpoints,
+# byte and packet counts in each direction, and a connection-state field.
+# Tab-separated, so the CSV decoder handles it with an explicit delimiter and
+# a header list, which also demonstrates the positional path.
+#
+# Real data: secrepo.com/maccdc2012/conn.log.gz (MACCDC 2012 competition
+# capture, real Bro/Zeek output). Every fixture below is an unmodified line
+# from the first 50 MB of that file.
+#
+# This pack's column order was corrected against that real data. The
+# previous version — written from a generic description of conn.log rather
+# than a real capture, and one of the packs the project's own README lists
+# as unverified — placed `local_orig`/`local_resp` immediately after
+# `conn_state`. Real Bro/Zeek output (this capture, and the era of Bro this
+# dataset comes from) instead puts a single `local_orig`, then
+# `missed_bytes`, `history`, `orig_pkts`, `orig_ip_bytes`, `resp_pkts`,
+# `resp_ip_bytes`, and a trailing `tunnel_parents` set. `src_endpoint`,
+# `dst_endpoint`, `connection_info.protocol_name`, the byte counts and
+# `conn_state` all sit before that split and were never affected; what the
+# old order got wrong was `history` and both packet counts, which each read
+# one column over from where the real data puts them.
+identity:
+  id: zeek-conn
+  vendor: Zeek Project
+  product: Zeek Network Security Monitor
+  log_format: zeek-tsv
+  priority: 12
+  detect:
+    - contains_all: ["	"]
+      contains_any: ["ShAdDaFf", "SHR", "OTH", "S0", "SF", "REJ", "RSTO", "RSTR"]
+      contains_none: ["#fields", "#separator", "#types"]
+
+extract:
+  - decoder: csv
+    delim: "	"
+    headers:
+      - ts
+      - uid
+      - id.orig_h
+      - id.orig_p
+      - id.resp_h
+      - id.resp_p
+      - proto
+      - service
+      - duration
+      - orig_bytes
+      - resp_bytes
+      - conn_state
+      - local_orig
+      - missed_bytes
+      - history
+      - orig_pkts
+      - orig_ip_bytes
+      - resp_pkts
+      - resp_ip_bytes
+      - tunnel_parents
+
+map:
+  class_uid: 4001                      # Network Activity
+  activity_id:
+    from: conn_state
+    enum: zeek_state
+    default: 6                         # Traffic
+  severity_id: 1
+  time:
+    from: ts
+    format: epoch_s
+  src_endpoint.ip:
+    from: id.orig_h
+    observable: ip
+  src_endpoint.port:
+    from: id.orig_p
+    as: int
+  dst_endpoint.ip:
+    from: id.resp_h
+    observable: ip
+  dst_endpoint.port:
+    from: id.resp_p
+    as: int
+  connection_info.protocol_name:
+    from: proto
+  connection_info.uid:
+    from: uid
+  app_name:
+    from: service
+  traffic.bytes_in:
+    from: resp_bytes
+    as: int
+  traffic.bytes_out:
+    from: orig_bytes
+    as: int
+  traffic.packets_in:
+    from: resp_pkts
+    as: int
+  traffic.packets_out:
+    from: orig_pkts
+    as: int
+  duration:
+    from: duration
+    as: int
+  unmapped.zeek_history:
+    from: history
+  unmapped.zeek_conn_state:
+    from: conn_state
+
+enums:
+  # Zeek conn_state values, from the Zeek conn.log documentation.
+  zeek_state:
+    S0: 4        # connection attempt, no reply -> Fail
+    S1: 1        # established, not terminated  -> Open
+    SF: 6        # normal establish and finish  -> Traffic
+    REJ: 5       # rejected                     -> Refuse
+    S2: 1
+    S3: 1
+    RSTO: 3      # originator sent RST          -> Reset
+    RSTR: 3      # responder sent RST           -> Reset
+    RSTOS0: 3
+    RSTRH: 3
+    SH: 2        # half-close                   -> Close
+    SHR: 2
+    OTH: 6
+
+fixtures:
+  - note: >
+      Real MACCDC 2012 line - completed HTTP connection. This is the fixture
+      the old column order got wrong: it would have read `orig_pkts` (here,
+      4) as `unmapped.zeek_history`, and one column of the packet counts as
+      the other's byte count.
+    raw: "1331901000.000000\tCHEt7z3AzG4gyCNgci\t192.168.202.79\t50465\t192.168.229.251\t80\ttcp\thttp\t0.010000\t166\t214\tSF\t-\t0\tShADfFa\t4\t382\t3\t382\t(empty)"
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      src_endpoint.ip: 192.168.202.79
+      src_endpoint.port: 50465
+      dst_endpoint.ip: 192.168.229.251
+      dst_endpoint.port: 80
+      connection_info.protocol_name: tcp
+      traffic.bytes_out: 166
+      traffic.bytes_in: 214
+      traffic.packets_out: 4
+      traffic.packets_in: 3
+      unmapped.zeek_history: ShADfFa
+
+  - note: Real MACCDC 2012 line - rejected connection, no observed bytes.
+    raw: "1331903863.080000\tCnvvpSp6Si0iV2tn5\t192.168.202.110\t26120\t192.168.27.102\t33075\ttcp\t-\t0.080000\t0\t0\tREJ\t-\t0\tSr\t1\t48\t1\t40\t(empty)"
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      dst_endpoint.port: 33075
+      traffic.packets_out: 1
+      traffic.packets_in: 1

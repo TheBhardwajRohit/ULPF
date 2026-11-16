@@ -1,0 +1,59 @@
+# ULPF collector, containerised. Requirement (k).
+#
+#   docker compose -f deploy/ulpf-compose.yaml up -d --build
+#
+# The console is published on loopback only. It authenticates nobody: it
+# refuses cross-origin and rebound requests, which stops a web page the
+# operator has open from driving it, but that is a browser-safety boundary,
+# not a login. Anyone who can reach the port can write Source Packs, and a
+# Source Pack decides how every subsequent record is interpreted.
+#
+# Exposing it on 0.0.0.0 therefore puts a control surface on the network. Put
+# an authenticating reverse proxy in front if it must be reachable from
+# another host.
+#
+# The syslog receiver is published on all interfaces, because devices have to
+# reach it. That is a receive-only UDP socket; every datagram is vaulted before
+# it is interpreted.
+
+services:
+  ulpf:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ulpf:local
+    container_name: ulpf
+    command:
+      - serve
+      - --packs=/app/packs
+      - --vault=/app/data/vault
+      - --integrity-dir=/app/data/integrity
+      - --chain=production
+      - --host=0.0.0.0
+      - --port=8787
+      - --syslog-bind=0.0.0.0:5514
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "5514:5514/udp"
+    volumes:
+      - ulpf-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    # `docker stop` sends SIGTERM, which the collector handles: it signs a
+    # final checkpoint for whatever arrived since the last periodic one and
+    # closes the Parquet writers, which is what writes their footers. Without
+    # that the feature table on the volume would never be readable. 30s is
+    # generous for both.
+    #
+    # A kill -9 still costs only the tail: the vault is append-only and the
+    # chain resumes from its last signed checkpoint.
+    stop_grace_period: 30s
+
+volumes:
+  ulpf-data:

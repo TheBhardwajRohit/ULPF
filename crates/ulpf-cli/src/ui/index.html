@@ -1,0 +1,3968 @@
+<!--
+  ULPF operator console.
+
+  Everything here is served from the binary via `include_str!` — no CDN, no web
+  font, no build step — because requirement (j) means this has to work on a host
+  with no route off the machine. Fonts fall back to the platform UI stack.
+
+  Layout follows the Wazuh/OUI convention an analyst already knows: a dark fixed
+  navigation rail, a breadcrumb bar carrying global state, and panelled content
+  with dense tables. State lives in one `refresh()` poll; every fetch checks
+  `res.ok` before it reports success.
+-->
+<title>ULPF Console</title>
+<script>
+  /* Runs before the stylesheet paints, so a stored dark choice never shows a
+     frame of light first. Wrapped: private-mode storage throws on read. */
+  try {
+    var t = localStorage.getItem("ulpf-theme");
+    if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<style>
+  :root{
+    --nav:#1D1E24; --nav-hover:#2B2D35; --nav-text:#98A2B3; --nav-active:#FFFFFF;
+    --page:#F7F8FC; --panel:#FFFFFF; --sunken:#F1F4FA; --border:#D3DAE6;
+    --text:#1A1C21; --text-2:#535966; --text-3:#7E8494;
+    --primary:#006BB4; --primary-soft:#E6F0F8;
+    --success:#00786B; --success-soft:#E0F2F0;
+    --warning:#8A6100; --warning-soft:#FDF3DC;
+    --danger:#BD271E; --danger-soft:#F8E7E6;
+    --shadow:0 1px 3px rgba(29,30,36,.08);
+    --radius:3px;
+
+    /* Fonts. Requirement (j) forbids a web font, so these are the stacks that
+       are actually on the machine -- previously the CSS asked for Inter and
+       JetBrains Mono, neither of which could ever load, and the console
+       silently rendered in the fallbacks anyway. Naming what really renders
+       means the sizes below were tuned against the face the operator sees.
+
+       Segoe UI Variable Text is the Windows 11 UI face at text sizes; the rest
+       is the standard platform ladder. Cascadia ships with Windows Terminal,
+       Consolas with everything since Vista. */
+    --ui:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    --mono:"Cascadia Mono",Consolas,ui-monospace,"SF Mono",Menlo,"DejaVu Sans Mono",monospace;
+
+    /* One scale, used everywhere, instead of nine sizes chosen per component.
+       Steps are close together on purpose: a console is read at a fixed
+       distance and large jumps waste vertical space that rows need. */
+    --t-micro:10px;   /* uppercase field labels */
+    --t-tiny:11.5px;  /* row captions, secondary notes */
+    --t-body:13px;    /* table cells, prose */
+    --t-lede:13.5px;  /* explanatory paragraphs */
+    --t-head:14px;    /* panel titles */
+    --t-page:20px;    /* view title */
+    --t-hero:34px;    /* the one number that leads a view */
+    --t-stat:22px;    /* supporting numbers beside it */
+    /* Read back by the drawing code through getComputedStyle, so a chart and
+       its legend can never disagree about a colour. */
+    --chart-1:#3568B8; --chart-2:#168672; --chart-3:#8B65B1; --chart-4:#B67828;
+    --chart-5:#438E91; --chart-6:#A75476; --chart-7:#758B3D; --chart-8:#5B718E;
+    --grid:#E5E9F1; --tip-meta:#B9C1D0; --hairline:rgba(29,30,36,.06);
+    --row-hover:rgba(0,0,0,.035); --row-sel:rgba(37,99,235,.09);
+    --scrim:rgba(20,21,25,.45); --on-accent:#FFFFFF;
+  }
+
+  /* Dark is a full re-declaration of the tokens above, never an inversion.
+     Three rules, because a viewer has three states: no stamp at all (follow
+     the OS), an explicit light choice, an explicit dark choice. The bare
+     :root block above is the light palette; nothing below it may declare a
+     colour literal, or that colour would survive into the wrong theme.
+
+     Adjustments made deliberately for dark, not mechanically:
+       - the page lifts off pure black to a blue ink, so panels can sit
+         *above* it and still read as raised;
+       - the nav stays the darkest surface, preserving the light-mode
+         relationship rather than flipping it;
+       - every accent gains lightness and loses saturation. #006BB4 on white
+         is calm; the same blue on near-black vibrates, so it becomes a
+         lighter, greyer #4BA3DC;
+       - the -soft fills become deep tints of their own hue instead of pale
+         washes, so a badge still reads as "blue" without glowing.
+
+     color-scheme is set per theme so native controls, scrollbars and form
+     widgets are repainted by the browser to match, instead of staying light
+     underneath a dark palette.
+
+     This was removed once, on the reasoning that a palette which follows the
+     OS is a palette nobody tuned. The second palette here is tuned -- that is
+     what the list above is -- and the premise does not hold for this product:
+     a SOC runs 24/7 shifts, often in a deliberately dim room, and analysts
+     split on which theme they want. Forcing either one on the other half is
+     the choice that costs something. The projector case is served by the
+     explicit light stamp, which wins over a dark OS. */
+  :root{color-scheme:light}
+
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      color-scheme:dark;
+      --nav:#0C1015; --nav-hover:#1B222B; --nav-text:#93A0AD; --nav-active:#FFFFFF;
+      --page:#12161B; --panel:#1A2028; --sunken:#151A21; --border:#2B3641;
+      --text:#E2E8EE; --text-2:#A5B2BE; --text-3:#7C8996;
+      --primary:#4BA3DC; --primary-soft:#0E2635;
+      --success:#3FB39E; --success-soft:#0D2C28;
+      --warning:#D9A93F; --warning-soft:#332711;
+      --danger:#E4695C;  --danger-soft:#3A1A17;
+      --shadow:0 1px 3px rgba(0,0,0,.6);
+      --node-device:#5C90DB;  --node-device-soft:#16243A;
+      --node-meaning:#38B096; --node-meaning-soft:#0E2E28;
+      --node-unknown:#DE6A5D; --node-unknown-soft:#3A1C19;
+      --chart-1:#5B93D8; --chart-2:#35A78E; --chart-3:#A585CE; --chart-4:#CE9450;
+      --chart-5:#5FA8AB; --chart-6:#C77593; --chart-7:#96AD59; --chart-8:#7B93B4;
+      --grid:#232C36; --tip-meta:#9AA7B4; --hairline:rgba(255,255,255,.06);
+      --row-hover:rgba(255,255,255,.045); --row-sel:rgba(75,163,220,.14);
+      --scrim:rgba(0,0,0,.62); --on-accent:#12161B;
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --nav:#0C1015; --nav-hover:#1B222B; --nav-text:#93A0AD; --nav-active:#FFFFFF;
+    --page:#12161B; --panel:#1A2028; --sunken:#151A21; --border:#2B3641;
+    --text:#E2E8EE; --text-2:#A5B2BE; --text-3:#7C8996;
+    --primary:#4BA3DC; --primary-soft:#0E2635;
+    --success:#3FB39E; --success-soft:#0D2C28;
+    --warning:#D9A93F; --warning-soft:#332711;
+    --danger:#E4695C;  --danger-soft:#3A1A17;
+    --shadow:0 1px 3px rgba(0,0,0,.6);
+    --node-device:#5C90DB;  --node-device-soft:#16243A;
+    --node-meaning:#38B096; --node-meaning-soft:#0E2E28;
+    --node-unknown:#DE6A5D; --node-unknown-soft:#3A1C19;
+    --chart-1:#5B93D8; --chart-2:#35A78E; --chart-3:#A585CE; --chart-4:#CE9450;
+    --chart-5:#5FA8AB; --chart-6:#C77593; --chart-7:#96AD59; --chart-8:#7B93B4;
+    --grid:#232C36; --tip-meta:#9AA7B4; --hairline:rgba(255,255,255,.06);
+    --row-hover:rgba(255,255,255,.045); --row-sel:rgba(75,163,220,.14);
+    --scrim:rgba(0,0,0,.62); --on-accent:#12161B;
+  }
+
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--page);color:var(--text);
+    font:400 var(--t-body)/1.55 var(--ui);
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:var(--mono)}
+
+  /* ------------------------------------------------- navigation rail */
+  .shell{display:flex;min-height:100vh}
+  nav.rail{
+    width:224px;flex:0 0 224px;background:var(--nav);color:var(--nav-text);
+    display:flex;flex-direction:column;position:sticky;top:0;height:100vh;
+  }
+  .brand{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid rgba(255,255,255,.07)}
+  .brand .mark{
+    width:28px;height:28px;border-radius:var(--radius);background:var(--primary);
+    display:grid;place-items:center;color:#fff;font-weight:700;font-size:13px;flex:0 0 28px;
+  }
+  .brand b{color:#fff;font-size:14px;letter-spacing:.2px}
+  .brand small{display:block;font-size:10.5px;color:var(--nav-text);letter-spacing:.06em;text-transform:uppercase}
+  .navgroup{padding:14px 0 4px}
+  .navgroup h6{
+    margin:0 0 6px;padding:0 18px;font-size:10px;letter-spacing:.13em;
+    text-transform:uppercase;color:#5F6675;font-weight:600;
+  }
+  .rail button.navitem{
+    display:flex;align-items:center;gap:11px;width:100%;padding:9px 18px;
+    background:none;border:0;border-left:3px solid transparent;color:var(--nav-text);
+    font:500 13.5px/1.3 inherit;cursor:pointer;text-align:left;
+  }
+  .rail button.navitem:hover{background:var(--nav-hover);color:#D6DBE4}
+  .rail button.navitem[aria-current="page"]{background:var(--nav-hover);color:var(--nav-active);border-left-color:var(--primary)}
+  .rail button.navitem svg{flex:0 0 16px;opacity:.85}
+  .navitem .tally{
+    margin-left:auto;font:500 11px/1 var(--mono);
+    background:rgba(255,255,255,.09);color:#C6CCD8;padding:3px 6px;border-radius:9px;
+  }
+  .rail .foot{margin-top:auto;padding:14px 18px;border-top:1px solid rgba(255,255,255,.07);font-size:11px;color:#5F6675}
+
+  /* ------------------------------------------------- top bar + content */
+  main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{
+    display:flex;align-items:center;gap:16px;padding:0 24px;height:52px;
+    background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20;
+  }
+  .crumb{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);font-weight:600}
+  .crumb b{color:var(--text-2)}
+  .topbar .spacer{flex:1}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:12px;
+    font:600 11px/1.35 inherit;white-space:nowrap;
+  }
+  .pill i{width:7px;height:7px;border-radius:50%;background:currentColor;display:block}
+  .pill.ok{background:var(--success-soft);color:var(--success)}
+  .pill.warn{background:var(--warning-soft);color:var(--warning)}
+  .pill.bad{background:var(--danger-soft);color:var(--danger)}
+  .pill.neutral{background:var(--sunken);color:var(--text-2)}
+  .pill.info{background:var(--primary-soft);color:var(--primary)}
+
+  .content{padding:22px 24px 56px;max-width:1500px;width:100%}
+  .view{display:none}
+  .view.active{display:block}
+  /* The title carries the view; the sentence under it is support, not a
+     co-equal headline. A rule closes the head so the content below reads as a
+     separate register rather than more of the same column. */
+  .pagehead{
+    display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;
+    margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border);
+  }
+  .pagehead h1{
+    margin:0;font-size:var(--t-page);font-weight:600;letter-spacing:-.3px;
+    line-height:1.2;
+  }
+  .pagehead p{margin:5px 0 0;color:var(--text-3);font-size:var(--t-tiny);max-width:76ch;line-height:1.55}
+  .pagehead .actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+
+  /* ------------------------------------------------- panels & controls */
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius)}
+  .panel-head{
+    display:flex;align-items:center;gap:12px;padding:11px 16px;
+    border-bottom:1px solid var(--border);background:var(--sunken);
+    border-radius:calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
+  }
+  .panel-head h2{
+    margin:0;font-size:var(--t-micro);font-weight:600;letter-spacing:.11em;
+    text-transform:uppercase;color:var(--text-2);
+  }
+  .panel-head .sub{font-size:var(--t-tiny);color:var(--text-3)}
+  .panel-head .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .panel-body{padding:16px}
+
+  .themebtn{
+    display:flex;align-items:center;gap:8px;width:100%;margin-bottom:10px;
+    padding:7px 9px;border:1px solid transparent;border-radius:var(--radius);
+    background:none;color:var(--nav-text);font:inherit;font-size:12.5px;
+    cursor:pointer;text-align:left;
+  }
+  .themebtn:hover{background:var(--nav-hover);color:var(--nav-active)}
+  .themebtn:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+
+  /* --------------------------------------------- live map (flow diagram) */
+  /* Colours are declared once and read back by the drawing code through
+     getComputedStyle, so a legend can never drift from what is on screen. */
+  :root{
+    --node-device:#3B6FC4; --node-device-soft:#E8EFFA;
+    --node-meaning:#12876F; --node-meaning-soft:#E1F2EE;
+    --node-unknown:#C0453A; --node-unknown-soft:#FBEAE8;
+  }
+  /* The explainer changes with the tab, because each view answers a different
+     question and one paragraph covering all three would explain none of them.
+     Written for a reader who has never seen a log file. */
+  .map-lede{
+    margin:18px 0 0;padding:16px 20px;background:var(--primary-soft);
+    border-left:3px solid var(--primary);border-radius:var(--radius);
+    font-size:13.5px;line-height:1.65;color:var(--text);max-width:none;
+  }
+  .map-lede b{font-weight:650}
+  .lede-what{max-width:96ch}
+  .lede-steps{
+    display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;
+    margin:13px 0 0;padding:0;list-style:none;counter-reset:lede;
+  }
+  .lede-steps li{
+    counter-increment:lede;position:relative;padding-left:27px;
+    font-size:12.5px;line-height:1.55;color:var(--text-2);
+  }
+  .lede-steps li::before{
+    content:counter(lede);position:absolute;left:0;top:0;
+    width:19px;height:19px;border-radius:50%;background:var(--primary);color:var(--on-accent);
+    font:650 11px/19px var(--ui);text-align:center;
+  }
+  .lede-steps b{display:block;color:var(--text);font-weight:650}
+  @media (max-width:1080px){ .lede-steps{grid-template-columns:1fr} }
+  .mapgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  .mapstat{
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:13px 15px;
+  }
+  .mapstat .v{font:650 26px/1.15 inherit;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+  .mapstat .k{font-size:12px;color:var(--text-2);margin-top:3px;font-weight:600}
+  /* The exact definition, under the readable one. Simplifying the captions had
+     dropped the units -- "the busiest it has been" left a bare 246 meaning
+     nothing -- so the plain line now names the unit and this line says
+     precisely what was measured. Plain and technical, not plain instead of
+     technical. */
+  .mapstat .k2,.trendstats .k2{font-size:10.5px;color:var(--text-3);margin-top:3px;line-height:1.45}
+  .mapstat.device .v{color:var(--node-device)}
+  .mapstat.meaning .v{color:var(--node-meaning)}
+  .mapstat.unknown .v{color:var(--node-unknown)}
+
+  .flowwrap{position:relative;background:var(--panel);overflow:hidden}
+  /* Rings sit beside their key rather than under it: the chart is square, so
+     stacking a full-width legend below it wastes the space either side. */
+  .ringwrap{display:grid;grid-template-columns:minmax(0,1fr) 290px;align-items:center;gap:4px}
+  #rings-svg{display:block;width:100%;height:clamp(440px,72vh,780px)}
+  .ringlegend{
+    display:flex;flex-direction:column;gap:10px;
+    padding:16px 22px 16px 0;
+  }
+  .ringrow{display:flex;align-items:center;gap:9px;font-size:12.5px;transition:opacity .14s}
+  .ringrow.dim{opacity:.35}
+  .ringrow .sw{width:11px;height:11px;border-radius:3px;flex:0 0 11px}
+  .ringrow .nm{flex:1;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ringrow .ct{color:var(--text-2);font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  #flow-panel:fullscreen .ringwrap{height:100%}
+  #flow-panel:fullscreen #rings-svg{height:100%}
+  @media (max-width:1080px){
+    .ringwrap{grid-template-columns:1fr}
+    .ringlegend{padding:0 16px 16px}
+  }
+  .flowhead{
+    display:flex;padding:11px 22px 0;font-size:10.5px;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--text-3);font-weight:650;
+  }
+  .flowhead .mid{flex:1;text-align:center}
+  .flowhead .rt{text-align:right}
+  #flow-svg{display:block;width:100%;height:clamp(400px,64vh,720px)}
+  #graph-svg{display:block;width:100%;height:clamp(380px,60vh,680px);background:
+    radial-gradient(circle at 50% 48%,color-mix(in srgb,var(--node-device) 9%,transparent),transparent 28%),
+    linear-gradient(var(--panel),var(--panel))}
+  #flow-svg text{font-family:var(--ui)}
+  #graph-svg text{font-family:var(--ui);pointer-events:none}
+  /* Eased, so a pointer moving across the picture fades rather than strobes. */
+  #flow-svg .ribbon,#flow-svg .flow-bar-group{transition:opacity .18s ease,fill-opacity .18s ease}
+  #flow-svg .ocsf{font-size:10px;fill:var(--text-3)}
+  #flow-svg .bar{cursor:default}
+  #flow-svg .lbl{font-size:12.5px;font-weight:600;fill:var(--text)}
+  #flow-svg .amt{font-size:11px;fill:var(--text-3);font-variant-numeric:tabular-nums}
+  #graph-svg .graph-edge{transition:opacity .14s,stroke-width .14s}
+  #graph-svg .graph-node{cursor:pointer;transition:opacity .14s}
+  #graph-svg .graph-label{font-size:11.5px;font-weight:600;fill:var(--text)}
+  #graph-svg .graph-meta{font-size:10px;fill:var(--text-3)}
+  .view-switch{display:inline-flex;padding:2px;border:1px solid var(--border);border-radius:6px;background:var(--sunken)}
+  .view-switch button{border:0;background:transparent;color:var(--text-2);padding:5px 10px;border-radius:4px;font:600 11.5px/1.2 inherit;cursor:pointer}
+  .view-switch button[aria-pressed="true"]{background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
+
+  /* Presentation mode. A projector is the worst case this view has: a room
+     reads it from six metres away. Fullscreen hands the drawing the whole
+     screen while keeping the head, so the live rate stays visible. */
+  #flow-panel:fullscreen{
+    display:flex;flex-direction:column;border:0;border-radius:0;
+    background:var(--panel);width:100vw;height:100vh;box-shadow:none;
+  }
+  #flow-panel:fullscreen .flowwrap{flex:1;min-height:0}
+  #flow-panel:fullscreen #flow-svg,#flow-panel:fullscreen #graph-svg{height:100%}
+  #flow-panel:fullscreen .panel-head{padding:15px 24px}
+  #flow-panel:fullscreen .panel-head h2{font-size:18px}
+  #flow-panel:fullscreen .flowhead{padding:13px 26px 0;font-size:12px}
+  #flow-panel:fullscreen .maplegend{padding:16px 24px;font-size:13.5px}
+  #flow-panel:fullscreen .mapnote{padding:13px 24px;font-size:12.5px}
+
+  .maptip{
+    position:absolute;pointer-events:none;z-index:5;opacity:0;transition:opacity .12s;
+    background:var(--nav);color:#fff;border-radius:var(--radius);padding:9px 11px;
+    font-size:12px;line-height:1.5;max-width:280px;box-shadow:0 4px 14px rgba(29,30,36,.22);
+  }
+  .maptip.on{opacity:1}
+  .maptip b{display:block;font-size:13px;margin-bottom:2px}
+  .maptip .m{color:var(--tip-meta);font-variant-numeric:tabular-nums}
+
+  .mapempty{
+    position:absolute;inset:0;display:grid;place-content:center;justify-items:center;
+    gap:6px;text-align:center;color:var(--text-2);padding:24px;background:var(--panel);
+  }
+  .mapempty b{font-size:15px;color:var(--text);font-weight:600}
+  .mapempty p{margin:0;font-size:13px;max-width:46ch}
+
+  .maplegend{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:18px;
+    padding:13px 16px;border-top:1px solid var(--border);
+  }
+  .maplegend .row{display:flex;align-items:flex-start;gap:9px;font-size:12px;line-height:1.45}
+  .maplegend .dot{width:11px;height:11px;border-radius:50%;margin-top:4px;flex:0 0 11px}
+  .maplegend .dot.device{background:var(--node-device)}
+  /* Meanings no longer share one colour, so the swatch shows that rather
+     than picking one of them and quietly misleading. */
+  .maplegend .dot.meaning{background:conic-gradient(var(--chart-2) 0 33%,var(--chart-1) 0 66%,var(--chart-3) 0)}
+  .maplegend .dot.unknown{background:var(--node-unknown)}
+  .maplegend b{display:block;font-weight:650}
+  .maplegend span{color:var(--text-2)}
+
+  .mapnote{
+    padding:10px 16px;border-top:1px solid var(--border);background:var(--sunken);
+    font-size:11.5px;color:var(--text-2);border-radius:0 0 var(--radius) var(--radius);
+  }
+  @media (max-width:1080px){
+    .mapgrid{grid-template-columns:repeat(2,1fr)}
+    .maplegend{grid-template-columns:1fr;gap:9px}
+    #flow-svg,#graph-svg{height:clamp(320px,50vh,520px)}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .maptip,#flow-svg .ribbon{transition:none}
+  }
+
+  /* -------------------------------------------------- tabs + globe + trend */
+  .tabbar{display:flex;gap:2px;margin-bottom:14px;border-bottom:1px solid var(--border)}
+  .tabbar .tab{
+    appearance:none;border:0;background:none;cursor:pointer;padding:9px 15px;
+    font:600 13px/1.4 inherit;color:var(--text-2);border-bottom:2px solid transparent;
+    margin-bottom:-1px;border-radius:var(--radius) var(--radius) 0 0;
+  }
+  .tabbar .tab:hover{background:var(--sunken);color:var(--text)}
+  .tabbar .tab[aria-selected="true"]{color:var(--primary);border-bottom-color:var(--primary)}
+  .tabbar .tab:focus-visible{outline:2px solid var(--primary);outline-offset:-2px}
+
+  .globewrap{position:relative;display:grid;grid-template-columns:1fr 320px;background:var(--panel)}
+  #globe-canvas{display:block;width:100%;height:clamp(420px,70vh,760px)}
+  .globeside{
+    border-left:1px solid var(--border);padding:16px;overflow-y:auto;
+    max-height:clamp(420px,70vh,760px);
+  }
+  .globeside h3{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);font-weight:650}
+  .globelist{display:flex;flex-direction:column;gap:9px}
+  .globerow{display:flex;align-items:baseline;gap:9px;font-size:12.5px}
+  .globerow .sw{width:9px;height:9px;border-radius:50%;flex:0 0 9px;align-self:center}
+  .globerow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+  .globerow .ct{font-variant-numeric:tabular-nums;color:var(--text-2);font-size:11.5px}
+
+  #globe-panel:fullscreen,#trend-panel:fullscreen{
+    display:flex;flex-direction:column;border:0;border-radius:0;
+    background:var(--panel);width:100vw;height:100vh;box-shadow:none;
+  }
+  #globe-panel:fullscreen .globewrap{flex:1;min-height:0}
+  #globe-panel:fullscreen #globe-canvas{height:100%}
+  #globe-panel:fullscreen .globeside{max-height:none;grid-template-columns:1fr 380px}
+  #trend-panel:fullscreen .trendwrap{flex:1;min-height:0;display:flex;flex-direction:column}
+  #trend-panel:fullscreen #trend-svg{flex:1;height:auto}
+
+  .trendwrap{position:relative;background:var(--panel);padding:4px 0 0}
+  .trendstats{
+    display:grid;grid-template-columns:repeat(4,1fr);gap:18px;
+    padding:16px 20px 10px;align-items:start;
+  }
+  .trendstats .v{font:650 24px/1.15 inherit;letter-spacing:-.4px;font-variant-numeric:tabular-nums;color:var(--primary)}
+  .trendstats .k{font-size:11.5px;color:var(--text-2);margin-top:2px;font-weight:600}
+  #trend-svg{display:block;width:100%;height:clamp(360px,56vh,620px)}
+  #trend-svg text{font-family:var(--ui);font-size:11px;fill:var(--text-3)}
+
+  @media (max-width:1080px){
+    .globewrap{grid-template-columns:1fr}
+    .globeside{border-left:0;border-top:1px solid var(--border);max-height:none}
+    .trendstats{grid-template-columns:repeat(2,1fr)}
+  }
+
+  /* ----------------------------------------------- source pulse workspace */
+  .analytics-kpis{
+    display:grid;grid-template-columns:minmax(208px,1.3fr) repeat(3,minmax(0,1fr));
+    gap:1px;margin-bottom:16px;
+  }
+  .akpi{background:var(--panel);box-shadow:0 0 0 1px var(--border);padding:14px 18px 15px}
+  .akpi .k{font-size:var(--t-micro);letter-spacing:.11em;text-transform:uppercase;color:var(--text-3);font-weight:600}
+  .akpi .v{font:600 var(--t-stat)/1.14 var(--mono);margin-top:8px;font-variant-numeric:tabular-nums;letter-spacing:-.4px}
+  .akpi:first-child .v{font-size:var(--t-hero);letter-spacing:-1px;margin-top:6px}
+  .akpi .n{font-size:var(--t-tiny);color:var(--text-3);margin-top:4px}
+  .pulse-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-left:auto}
+  .pulse-toolbar input{width:min(250px,42vw)}.pulse-toolbar select{min-width:145px}
+  .pulse-summary{display:flex;align-items:center;gap:18px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--sunken);color:var(--text-2);font-size:12px}
+  .pulse-summary b{color:var(--text);font-size:16px;margin-right:4px;font-variant-numeric:tabular-nums}
+  .source-pulses{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:18px}
+  .source-pulse{border:1px solid var(--border);border-radius:7px;padding:16px 17px 13px;background:var(--panel);min-height:275px;box-shadow:0 1px 2px rgba(29,30,36,.04);transition:border-color .15s,box-shadow .15s}
+  .source-pulse:hover{border-color:var(--text-3);box-shadow:0 5px 18px rgba(35,48,70,.08)}
+  .source-pulse-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}
+  .source-pulse-name{font-size:14px;font-weight:650;min-width:0}.source-pulse-name small{display:block;color:var(--text-3);font:400 10.5px/1.5 var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .source-pulse-total{text-align:right;font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}.source-pulse-total small{display:block;color:var(--text-3);font-size:10px;font-weight:500}
+  .source-pulse-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:13px 0 4px}
+  .source-pulse-metrics div{padding:7px 9px;border-radius:5px;background:var(--sunken)}.source-pulse-metrics b{display:block;font-size:13px;font-variant-numeric:tabular-nums}.source-pulse-metrics span{font-size:9.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em}
+  .source-pulse-chart{position:relative}.source-pulse svg{display:block;width:100%;height:145px;overflow:visible}
+  .source-pulse-foot{display:flex;justify-content:space-between;margin-top:3px;color:var(--text-3);font-size:10.5px}
+  .pulse-empty{grid-column:1/-1;min-height:360px;display:grid;place-content:center;justify-items:center;text-align:center;color:var(--text-2)}.pulse-empty b{font-size:15px;color:var(--text)}
+  @media(max-width:1080px){.analytics-kpis{grid-template-columns:repeat(2,1fr)}.akpi:first-child .v{font-size:var(--t-stat);letter-spacing:-.4px;margin-top:8px}.source-pulses{grid-template-columns:1fr}}
+  @media(max-width:650px){.analytics-kpis{grid-template-columns:1fr}.pulse-toolbar{width:100%}.pulse-toolbar input,.pulse-toolbar select{width:100%}.source-pulses{padding:12px}.source-pulse-metrics{grid-template-columns:1fr}.source-pulse{min-height:310px}}
+
+  /* ---------------------------------------- the before/after strip */
+  .ros-lede{margin:0 0 14px;font-size:13.5px;line-height:1.6;color:var(--text-2);max-width:none}
+  .ros-lede b{color:var(--text);font-weight:650}
+  .roscols{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .roscard{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column}
+  .roscard .who{
+    padding:9px 12px;background:var(--node-device-soft);border-bottom:1px solid var(--border);
+    font-weight:650;font-size:12.5px;color:var(--node-device);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .roscard .step{padding:8px 12px 4px;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-3);font-weight:650}
+  .roscard .rawline{
+    margin:0 12px 10px;padding:9px 10px;background:var(--nav);color:var(--nav-text);border-radius:var(--radius);
+    font-family:var(--mono);font-size:10.5px;line-height:1.55;
+    word-break:break-all;max-height:96px;overflow:hidden;
+  }
+  .rosarrow{display:grid;place-items:center;padding:0 0 6px;color:var(--node-meaning)}
+  .roscard dl{margin:0 12px 12px;display:grid;grid-template-columns:auto 1fr;gap:5px 10px;font-size:12px}
+  .roscard dt{color:var(--text-3);white-space:nowrap}
+  .roscard dd{margin:0;font-weight:600;overflow-wrap:anywhere}
+  .roscard dd:not(.mono){font-weight:500;color:var(--text-2)}
+  .roscard dd.mono{font-family:var(--mono);font-size:11.5px;font-weight:500}
+  .roscard .meaning{
+    margin:auto 12px 12px;padding:7px 10px;background:var(--node-meaning-soft);
+    color:var(--node-meaning);border-radius:var(--radius);font-weight:650;font-size:12.5px;text-align:center;
+  }
+  .rosempty{padding:26px;text-align:center;color:var(--text-2);font-size:13px}
+  @media (max-width:1080px){ .roscols{grid-template-columns:1fr} }
+
+  .mapnote{
+    padding:10px 16px;border-top:1px solid var(--border);background:var(--sunken);
+    font-size:11.5px;color:var(--text-2);border-radius:0 0 var(--radius) var(--radius);
+  }
+  @media (max-width:1080px){
+    .mapgrid{grid-template-columns:repeat(2,1fr)}
+    .maplegend{grid-template-columns:1fr;gap:9px}
+    #map-canvas{height:clamp(300px,48vh,460px)}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .maptip{transition:none}
+  }
+
+  [hidden]{display:none!important}
+  .btn{
+    display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:var(--radius);
+    border:1px solid var(--border);background:var(--panel);color:var(--text);
+    font:600 12.5px/1.35 inherit;cursor:pointer;
+  }
+  .btn:hover:not(:disabled){background:var(--sunken)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.primary{background:var(--primary);border-color:var(--primary);color:var(--on-accent)}
+  /* The base hover rule is `.btn:hover:not(:disabled)` — specificity (0,3,0) —
+     while `.btn.primary` is only (0,2,0), so hovering a primary button replaced
+     its background with the light `--sunken` and left the text white on it.
+     Restating the background here, at (0,4,0), keeps it. */
+  .btn.primary:hover:not(:disabled){background:var(--primary);filter:brightness(1.08)}
+  .btn.danger{background:var(--danger);border-color:var(--danger);color:var(--on-accent)}
+  .btn.danger:hover:not(:disabled){background:var(--danger);filter:brightness(1.08)}
+  .btn.sm{padding:5px 9px;font-size:11.5px}
+  .btn:focus-visible,.navitem:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{
+    outline:2px solid var(--primary);outline-offset:1px
+  }
+  input,textarea,select{
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+    color:var(--text);padding:7px 9px;font:400 13px/1.4 inherit;
+  }
+  input.mono,textarea.mono{font-family:var(--mono);font-size:12.5px}
+  label.field{display:flex;flex-direction:column;gap:5px;font:600 11px/1 inherit;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em}
+  label.field input,label.field select{text-transform:none;letter-spacing:0;font-weight:400}
+
+  /* ------------------------------------------------- stat row */
+  /* One instrument, ruled into cells -- not five cards in a row.
+
+     Five separately bordered, shadowed boxes gave the headline count and a
+     footnote identical weight, which is the giveaway of a dashboard laid out
+     by a grid rather than by what matters. Here the row is a single panel
+     divided by hairlines, and the first cell leads at --t-hero while the rest
+     sit at --t-stat. An operator's eye lands on the number that matters and
+     the others stay available without competing.
+
+     Each cell rules itself with a 1px box-shadow ring rather than the grid
+     painting a background behind 1px gaps. The background trick is tidier
+     until the row wraps: the container then shows through every unfilled
+     track as a block of rule colour. A ring belongs to the cell, so a short
+     final row simply ends. */
+  .stats{
+    display:grid;grid-template-columns:minmax(208px,1.3fr) repeat(auto-fit,minmax(142px,1fr));
+    gap:1px;margin-bottom:16px;
+  }
+  .stat{background:var(--panel);box-shadow:0 0 0 1px var(--border);padding:14px 18px 15px}
+  .stat .k{
+    font-size:var(--t-micro);letter-spacing:.11em;text-transform:uppercase;
+    color:var(--text-3);font-weight:600;
+  }
+  .stat .v{
+    font:600 var(--t-stat)/1.14 var(--mono);font-variant-numeric:tabular-nums;
+    margin-top:8px;letter-spacing:-.4px;
+  }
+  .stat:first-child .v{font-size:var(--t-hero);letter-spacing:-1px;margin-top:6px}
+  .stat .n{font-size:var(--t-tiny);color:var(--text-3);margin-top:4px}
+  .stat.accent .v{color:var(--primary)}
+  .stat.good .v{color:var(--success)}
+  .stat.warn .v{color:var(--warning)}
+  @media (max-width:760px){
+    .stats{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+    .stat:first-child .v{font-size:var(--t-stat);letter-spacing:-.4px;margin-top:8px}
+  }
+
+  /* ------------------------------------------------- tables */
+  .tablewrap{overflow-x:auto}
+  /* Row rules use --hairline, not --border. A full-strength rule under every
+     row is a lot of ink at console density and fights the header rule, which
+     is the one that has to hold the columns. Digits are tabular table-wide so
+     any column of numbers aligns without each cell opting in. */
+  table{
+    border-collapse:collapse;width:100%;font-size:var(--t-body);
+    font-variant-numeric:tabular-nums;
+  }
+  thead th{
+    position:sticky;top:0;background:var(--sunken);text-align:left;
+    font:600 var(--t-micro)/1 inherit;letter-spacing:.11em;text-transform:uppercase;color:var(--text-3);
+    padding:9px 12px;border-bottom:1px solid var(--border);white-space:nowrap;z-index:1;
+  }
+  tbody td{padding:9px 12px;border-bottom:1px solid var(--hairline);vertical-align:middle;color:var(--text-2)}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr.clickable{cursor:pointer}
+  tbody tr.clickable:hover td{background:var(--sunken)}
+  td.mono,th.mono{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+  td.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  th.num{text-align:right}
+  .empty{padding:34px 16px;text-align:center;color:var(--text-3);font-size:13px}
+
+  /* ------------------------------------------------- misc blocks */
+  .codebox{
+    background:var(--sunken);border:1px solid var(--border);border-radius:var(--radius);
+    padding:12px 14px;font:400 12px/1.65 var(--mono);
+    color:var(--text-2);overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word;margin:0;
+  }
+  .callout{border-left:3px solid var(--c);background:var(--cs);padding:11px 14px;border-radius:0 var(--radius) var(--radius) 0;font-size:13px;color:var(--text-2)}
+  .callout.ok{--c:var(--success);--cs:var(--success-soft)}
+  .callout.bad{--c:var(--danger);--cs:var(--danger-soft)}
+  .callout.info{--c:var(--primary);--cs:var(--primary-soft)}
+  .callout.warn{--c:var(--warning);--cs:var(--warning-soft)}
+  .callout b{color:var(--text)}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+  .rowline{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+
+  /* ------------------------------------------------- drawer */
+  .backdrop{position:fixed;inset:0;background:var(--scrim);display:none;z-index:40}
+  .backdrop.open{display:block}
+  .drawer{
+    position:fixed;top:0;right:0;height:100vh;width:min(680px,94vw);background:var(--panel);
+    border-left:1px solid var(--border);transform:translateX(100%);transition:transform .18s ease;
+    z-index:41;display:flex;flex-direction:column;
+  }
+  .drawer.open{transform:none}
+  .drawer-head{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border)}
+  .drawer-head h3{margin:0;font-size:15px;font-weight:600}
+  .drawer-body{padding:18px;overflow:auto;display:flex;flex-direction:column;gap:16px}
+  .drawer-body h4{margin:0 0 7px;font:600 10.5px/1 inherit;letter-spacing:.11em;text-transform:uppercase;color:var(--text-3)}
+  .drawer{width:min(820px,96vw)}
+
+  /* Event detail: a definition grid rather than a JSON dump. Values keep the
+     mono face so hashes and addresses stay scannable; labels do not. */
+  .kv{display:grid;grid-template-columns:minmax(130px,auto) minmax(0,1fr);gap:6px 16px;align-items:baseline}
+  .kv dt{font-size:12.5px;color:var(--text-3)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+  .kv dd .muted{font-family:inherit}
+  .kv dd em{font-style:normal;color:var(--text-3);font-family:inherit;font-size:12px}
+
+  /* drawer-body is a flex column, so its children shrink to fit unless told
+     otherwise — which silently clipped every section to a few pixels. */
+  .drawer-body > *{flex:0 0 auto}
+  .sect{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  .sect > summary{
+    padding:10px 14px;background:var(--sunken);cursor:pointer;list-style:none;
+    font:600 11px/1 inherit;letter-spacing:.1em;text-transform:uppercase;color:var(--text-2);
+    display:flex;align-items:center;gap:8px;
+  }
+  .sect > summary::-webkit-details-marker{display:none}
+  .sect > summary::before{
+    content:"";width:0;height:0;flex:none;
+    border-left:5px solid currentColor;border-top:4px solid transparent;border-bottom:4px solid transparent;
+    transition:transform .12s
+  }
+  .sect[open] > summary::before{transform:rotate(90deg)}
+  .sect > summary:hover{background:var(--border)}
+  .sect .sect-body{padding:14px}
+
+  .headline{
+    padding:13px 15px;border-radius:var(--radius);background:var(--primary-soft);
+    border:1px solid color-mix(in srgb,var(--primary) 34%,transparent);font-size:13.5px;line-height:1.55;color:var(--text)
+  }
+  .headline b{font-weight:600}
+
+  .explain{font-size:13px;line-height:1.62;color:var(--text-2)}
+  .explain p{margin:0 0 10px}
+  .explain p:last-child{margin-bottom:0}
+  .explain b{color:var(--text);font-weight:600}
+  .explain code{
+    font-family:var(--mono);font-size:12px;
+    background:var(--sunken);padding:1px 5px;border-radius:3px
+  }
+
+  .ask-row{display:flex;gap:8px;margin-top:10px}
+  .ask-row input{
+    flex:1;padding:9px 11px;border:1px solid var(--border);border-radius:var(--radius);
+    font:13px inherit;background:var(--panel);color:var(--text)
+  }
+  .ask-log{display:flex;flex-direction:column;gap:9px;margin-top:12px}
+  .ask-log:empty{display:none}
+  .ask-q{align-self:flex-end;max-width:88%;background:var(--primary);color:var(--on-accent);padding:8px 12px;border-radius:var(--radius);font-size:13px}
+  .ask-a{align-self:flex-start;max-width:95%;background:var(--sunken);padding:10px 12px;border-radius:var(--radius);font-size:13px;line-height:1.55;white-space:pre-wrap}
+  .chip-sm{display:inline-block;padding:1px 7px;border-radius:10px;font:600 10.5px/1.7 inherit;background:var(--sunken);color:var(--text-2)}
+
+  /* ------------------------------------------------- chat */
+  .chat{display:flex;flex-direction:column;gap:11px;min-height:300px;max-height:52vh;overflow:auto;padding:2px}
+  .msg{max-width:82%;padding:10px 13px;border-radius:var(--radius);font-size:13.5px;white-space:pre-wrap;word-break:break-word}
+  .msg.user{align-self:flex-end;background:var(--primary);color:var(--on-accent)}
+  .msg.bot{align-self:flex-start;background:var(--sunken);border:1px solid var(--border);color:var(--text-2)}
+  .msg.err{align-self:flex-start;background:var(--danger-soft);border:1px solid var(--danger);color:var(--danger)}
+
+  @media (max-width:860px){
+    nav.rail{position:fixed;left:0;top:0;z-index:50;transform:translateX(-100%);transition:transform .18s}
+    nav.rail.open{transform:none}
+    .content{padding:16px 14px 48px}
+  }
+  /* ------------------------------------------------------------- raw logs
+     The evidence view. A two-column split: the arriving records on the left,
+     the selected record's original bytes on the right. The list is its own
+     scroll container so that following a live stream never walks the page. */
+  .rawgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+  @media (max-width:1100px){.rawgrid{grid-template-columns:minmax(0,1fr)}}
+  .rawlist{max-height:min(64vh,680px);overflow:auto}
+  .rawrow{
+    display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);
+    background:none;padding:9px 14px;cursor:pointer;font:inherit;color:inherit
+  }
+  .rawrow:hover{background:var(--row-hover)}
+  .rawrow[aria-current="true"]{background:var(--row-sel);box-shadow:inset 3px 0 0 var(--primary)}
+  .rawrow .rawtop{display:flex;gap:8px;align-items:baseline;font-size:11.5px;color:var(--text-3)}
+  .rawrow .rawtop b{color:var(--text-2);font-weight:600}
+  /* The log line itself: one line, clipped, never wrapped. A wrapped preview
+     makes rows different heights and the list impossible to scan. */
+  .rawrow .rawline{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
+    margin-top:3px;white-space:pre;overflow:hidden;text-overflow:ellipsis;color:var(--text-1)
+  }
+  .rawtext{white-space:pre-wrap;word-break:break-word;min-height:90px;margin:0}
+  .rawmeta{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 14px;margin:0;font-size:12.5px}
+  .rawmeta dt{color:var(--text-3)}
+  .rawmeta dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+  .rawlive{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2)}
+
+  /* --------------------------------------------------- candidate pack editor
+     The draft is a proposal, not a verdict, so it is a textarea rather than a
+     <pre>. It keeps the codebox skin so that editing does not feel like a
+     different surface from reading. */
+  .packedit{
+    width:100%;min-height:340px;resize:vertical;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55;
+    white-space:pre;overflow:auto;tab-size:2
+  }
+  .packedit:focus{outline:2px solid var(--primary);outline-offset:-2px}
+  .editnote{font-size:12.5px;line-height:1.5}
+
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="shell">
+  <nav class="rail" id="rail">
+    <div class="brand">
+      <div class="mark">U</div>
+      <div><b>ULPF</b><small>OCSF <span id="schema-ver">1.9.0</span></small></div>
+    </div>
+
+    <div class="navgroup">
+      <h6>Monitoring</h6>
+      <button class="navitem" data-view="rawlogs">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h13l3 3v13H4z"/><path d="M7 9h8M7 13h10M7 17h6"/></svg>
+        Raw logs <span class="tally" id="tally-raw">0</span>
+      </button>
+      <button class="navitem" data-view="livemap">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.4"/><circle cx="5" cy="18" r="2.4"/><circle cx="19" cy="12" r="3.2"/><path d="M7.2 7.1 15.9 10.6M7.2 16.9l8.7-3.5"/></svg>
+        Live Map
+      </button>
+      <button class="navitem" data-view="overview" aria-current="page">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+        Overview
+      </button>
+      <button class="navitem" data-view="analytics">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V9m5 10V5m5 14v-7m5 7V3"/></svg>
+        Analytics
+      </button>
+      <button class="navitem" data-view="events">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        Events <span class="tally" id="tally-events">0</span>
+      </button>
+    </div>
+
+    <div class="navgroup">
+      <h6>Onboarding</h6>
+      <button class="navitem" data-view="clusters">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.5 7.5 11 15m4.5-7.5L13 15"/></svg>
+        Needs a pack <span class="tally" id="tally-clusters">0</span>
+      </button>
+      <button class="navitem" data-view="packs">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8l-9-5-9 5v8l9 5 9-5zM3.3 7.3 12 12l8.7-4.7M12 22V12"/></svg>
+        Source Packs <span class="tally" id="tally-packs">0</span>
+      </button>
+    </div>
+
+    <div class="navgroup">
+      <h6>Assurance</h6>
+      <button class="navitem" data-view="integrity">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        Integrity
+      </button>
+      <button class="navitem" data-view="assistant">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Assistant
+      </button>
+    </div>
+
+    <div class="foot">
+      <button class="themebtn" id="themebtn" type="button" aria-pressed="false">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>
+        <span id="themebtn-label">Dark theme</span>
+      </button>
+      <a href="/dev" style="color:var(--nav-text)">Traffic simulator &rarr;</a>
+    </div>
+  </nav>
+
+  <main>
+    <div class="topbar">
+      <div class="crumb">ULPF / <b id="crumb">OVERVIEW</b></div>
+      <div class="spacer"></div>
+      <span class="pill neutral" id="chain-pill" title="Signed checkpoint state"><i></i> chain idle</span>
+      <span class="pill ok" id="engine-pill"><i></i> Engine online</span>
+    </div>
+
+    <div class="content">
+
+      <!-- ============================================ OVERVIEW -->
+      <section class="view" id="view-rawlogs">
+        <div class="pagehead">
+          <div>
+            <h1>Raw logs</h1>
+            <p>What the devices actually wrote, byte for byte. Every line here was read back <b>out of the vault</b> by its locator &mdash; this is not a copy the console kept, it is the same retrieval an investigator would run months later. Select a record to see its original text and check it against the fingerprint taken at ingest.</p>
+          </div>
+          <div class="actions">
+            <button class="btn sm" type="button" id="btn-raw-refresh">Refresh</button>
+            <label class="rawlive"><input type="checkbox" id="raw-follow" checked> Follow live</label>
+          </div>
+        </div>
+
+        <div class="rawgrid">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Arriving records</h2>
+              <span class="sub">newest first</span>
+              <div class="right"><span class="pill neutral" id="raw-count">0 records</span></div>
+            </div>
+            <div class="panel-body" style="padding:0">
+              <div class="rawlist" id="raw-list">
+                <div class="empty" style="padding:22px">No records yet. Turn a source on in the <a href="/dev">traffic simulator</a>.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Original bytes</h2>
+              <span class="sub" id="raw-sub">select a record</span>
+              <div class="right"><span class="pill neutral" id="raw-verify-pill" hidden></span></div>
+            </div>
+            <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+              <pre class="codebox rawtext" id="raw-detail">Select a record on the left to retrieve its original bytes from the vault.</pre>
+              <dl class="rawmeta" id="raw-meta" hidden></dl>
+              <div class="rowline">
+                <button class="btn primary sm" type="button" id="btn-raw-normalized" hidden>See the normalized OCSF event &rarr;</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-livemap">
+        <div class="pagehead">
+          <div>
+            <h1>Live Map</h1>
+            <p>What the collector is doing right now, as a picture. Switch between precise flow and an explorable graph; both update every two seconds.</p>
+          </div>
+          <div class="actions">
+            <button class="btn" id="flow-full">Full screen</button>
+          </div>
+        </div>
+
+        <div class="mapgrid">
+          <div class="mapstat device"><div class="v" id="map-k-devices">0</div><div class="k">products sending logs</div><div class="k2">Source Packs that have claimed at least one record</div></div>
+          <div class="mapstat meaning"><div class="v" id="map-k-meanings">0</div><div class="k">shared meanings in use</div><div class="k2">distinct OCSF event classes produced so far</div></div>
+          <div class="mapstat"><div class="v" id="map-k-events">0</div><div class="k">records normalised</div><div class="k2">read, mapped to OCSF and sealed, since start</div></div>
+          <div class="mapstat unknown"><div class="v" id="map-k-unknown">0</div><div class="k">records not recognised</div><div class="k2" id="map-k-unknown-sub">vaulted intact; no pack detector matched them</div></div>
+        </div>
+
+        <div class="tabbar" role="tablist" aria-label="Live map views">
+          <button class="tab" role="tab" data-tab="flow" aria-selected="true">What happens to the logs</button>
+          <button class="tab" role="tab" data-tab="trend" aria-selected="false">How fast it is running</button>
+        </div>
+
+        <div class="tabpanel" id="tab-flow" role="tabpanel">
+        <div class="panel" id="flow-panel">
+          <div class="panel-head">
+            <h2>Every log, and what it became</h2>
+            <span class="sub" id="flow-sub">waiting for traffic</span>
+            <div class="right">
+              <span class="pill neutral" id="map-rate"><i></i> idle</span>
+            </div>
+          </div>
+          <div class="flowwrap">
+            <div class="flowhead" id="flow-head">
+              <span>What sent the log</span>
+              <span class="mid">becomes</span>
+              <span class="rt">what it became</span>
+            </div>
+            <svg id="flow-svg" role="img" aria-label="Flow from each kind of device to the shared meaning its records became"></svg>
+            <div class="maptip" id="flow-tip"></div>
+            <div class="mapempty" id="flow-empty">
+              <b>No traffic yet</b>
+              <p>Start the traffic simulator, or send logs to the collector, and this fills in by itself.</p>
+              <a class="btn" href="/dev">Open the traffic simulator</a>
+            </div>
+          </div>
+          <div class="maplegend">
+            <div class="row"><span class="dot device"></span><span><b>A kind of device</b><span>A product whose logs ULPF already knows how to read.</span></span></div>
+            <div class="row"><span class="dot meaning"></span><span><b>A shared meaning</b><span>The common language every device is rewritten into. Each one has its own colour, and the band leading into it matches.</span></span></div>
+            <div class="row"><span class="dot unknown"></span><span><b>Not understood yet</b><span>Read, timestamped and stored in full, and searchable by address or user. What is missing is a Source Pack naming this product's fields &mdash; a cluster here is a device queued for onboarding, not a record lost.</span></span></div>
+          </div>
+          <div class="mapnote" id="map-note"></div>
+        </div>
+
+        <div class="panel" id="rosetta-panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h2>The same three questions, whatever the device</h2>
+            <span class="sub" id="ros-sub">waiting for traffic</span>
+            <div class="right">
+              <button class="btn sm" id="ros-next">Show another</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <p class="ros-lede">
+              This is the whole idea in one screen. On the left is exactly what each device wrote &mdash; three
+              products, three completely different ways of saying things. On the right is what ULPF turned each one
+              into. <b>The questions on the right are identical every time.</b> That is what makes one search work
+              across every device in a building.
+            </p>
+            <div class="roscols" id="ros-cols"></div>
+          </div>
+        </div>
+        </div><!-- /tab-flow -->
+
+        <div class="tabpanel" id="tab-trend" role="tabpanel" hidden>
+          <div class="panel" id="trend-panel">
+            <div class="panel-head">
+              <h2>How fast it is running</h2>
+              <span class="sub" id="trend-sub">collecting</span>
+              <div class="right">
+                <button class="btn sm" id="trend-full">Full screen</button>
+                <span class="pill neutral" id="trend-rate"><i></i> idle</span>
+              </div>
+            </div>
+            <div class="trendwrap">
+              <div class="trendstats">
+                <div><div class="v" id="tr-now">0</div><div class="k">logs per second, right now</div><div class="k2">measured over the last refresh</div></div>
+                <div><div class="v" id="tr-peak">0</div><div class="k">logs per second, peak</div><div class="k2">highest single measurement since this page opened</div></div>
+                <div><div class="v" id="tr-avg">0</div><div class="k">logs per second, average</div><div class="k2">mean of every measurement while traffic was flowing</div></div>
+                <div><div class="v" id="tr-cov">—</div><div class="k">of records recognised</div><div class="k2">share of all received that a Source Pack claimed</div></div>
+              </div>
+              <svg id="trend-svg" role="img" aria-label="Records per second over the last few minutes"></svg>
+              <div class="maptip" id="trend-tip"></div>
+              <div class="mapempty" id="trend-empty">
+                <b>Nothing measured yet</b>
+                <p>This fills in as records arrive. A minute of traffic gives it something to draw.</p>
+                <a class="btn" href="/dev">Open the traffic simulator</a>
+              </div>
+            </div>
+            <div class="mapnote" id="trend-note"></div>
+          </div>
+        </div>
+
+        <div class="map-lede" id="map-lede">
+          <div class="lede-what" id="lede-what"></div>
+          <ol class="lede-steps" id="lede-steps"></ol>
+        </div>
+      </section>
+
+      <!-- =========================================== ANALYTICS -->
+      <section class="view" id="view-analytics">
+        <div class="pagehead">
+          <div><h1>Source pulse</h1><p>A focused live view of how much traffic each Source Pack is handling. Every point is measured from this collector.</p></div>
+          <div class="actions"><span class="pill neutral" id="analytics-window"><i></i> collecting</span></div>
+        </div>
+        <div class="analytics-kpis">
+          <div class="akpi"><div class="k">Events received</div><div class="v" id="ak-received">0</div><div class="n" id="ak-sources">0 active sources</div></div>
+          <div class="akpi"><div class="k">Normalized coverage</div><div class="v" id="ak-coverage">0.0000%</div><div class="n" id="ak-parsed">0 records mapped</div></div>
+          <div class="akpi"><div class="k">Combined source rate</div><div class="v" id="ak-rate">0 EPS</div><div class="n" id="ak-peak">peak 0 EPS</div></div>
+          <div class="akpi"><div class="k">Needs a source pack</div><div class="v" id="ak-unknown">0</div><div class="n">vaulted for later recognition</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Active Source Packs</h2><span class="sub">large per-source trends</span>
+            <div class="pulse-toolbar">
+              <input id="pulse-search" type="search" aria-label="Filter Source Packs" placeholder="Filter sources">
+              <select id="pulse-sort" aria-label="Sort Source Packs"><option value="volume">Highest volume</option><option value="rate">Highest rate</option><option value="name">Source name</option></select>
+            </div>
+          </div>
+          <div class="pulse-summary">
+            <span><b id="pulse-active">0</b> active sources</span>
+            <span><b id="pulse-combined">0</b> events/sec combined</span>
+            <span><b id="pulse-samples">0</b> live samples</span>
+          </div>
+          <div class="source-pulses" id="source-pulses"><div class="pulse-empty"><b>No source traffic yet</b><span>Start the traffic simulator or connect a log source.</span></div></div>
+        </div>
+      </section>
+
+      <section class="view active" id="view-overview">
+        <div class="pagehead">
+          <div>
+            <h1>Overview</h1>
+            <p>Live normalization across every connected source. Counters are cumulative for this collector; the table is the most recent 500 events.</p>
+          </div>
+          <div class="actions">
+            <button class="btn" type="button" id="btn-clear">Clear view</button>
+          </div>
+        </div>
+
+        <div class="stats">
+          <div class="stat"><div class="k">Events received</div><div class="v" id="st-recv">0</div><div class="n" id="st-rate">awaiting traffic</div></div>
+          <div class="stat good"><div class="k">Normalized to OCSF</div><div class="v" id="st-parsed">0</div><div class="n" id="st-cov">0.0000% coverage</div></div>
+          <div class="stat warn"><div class="k">Needs a pack</div><div class="v" id="st-unid">0</div><div class="n" id="st-unid-note">no unparsed records</div></div>
+          <div class="stat"><div class="k">Vaulted</div><div class="v" id="st-bytes">0 B</div><div class="n">append-only, before parsing</div></div>
+          <div class="stat accent"><div class="k">Sealed this session</div><div class="v" id="st-seq">0</div><div class="n" id="st-chain">no checkpoint yet</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Live events</h2>
+            <span class="sub" id="ev-sub">newest first</span>
+            <div class="right"><span class="pill info" id="ev-count">most recent 0</span></div>
+          </div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr>
+                <th>Time</th><th>Vendor / product</th><th>Class</th>
+                <th>Source</th><th>Destination</th><th>Pack</th><th>Status</th>
+              </tr></thead>
+              <tbody id="events-body"><tr><td colspan="7" class="empty">No events yet. Open the traffic simulator, or point a device at the syslog receiver.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================ EVENTS -->
+      <section class="view" id="view-events">
+        <div class="pagehead">
+          <div>
+            <h1>Event inspector</h1>
+            <p>Paste raw log lines to run them through the real pipeline &mdash; the same vault, packs, mapping and attestation the collector uses. Nothing here is simulated.</p>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <div class="panel-head"><h2>Ingest raw lines</h2><span class="sub">one record per line</span></div>
+            <div class="panel-body">
+              <textarea id="ingest-text" class="mono" rows="9" style="width:100%" placeholder="&lt;134&gt;date=2026-08-31 devname=&quot;FGT-01&quot; type=traffic srcip=10.2.4.7 dstip=8.8.8.8 action=accept"></textarea>
+              <div class="rowline" style="margin-top:10px">
+                <button class="btn primary" type="button" id="btn-ingest">Normalize</button>
+                <span class="pill neutral" id="ingest-status" hidden></span>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Result</h2><span class="sub">pack, extracted fields, OCSF event</span></div>
+            <div class="panel-body"><pre class="codebox" id="ingest-result">Run a line to see which pack claimed it, what the decoder chain extracted, and the OCSF event that came out.</pre></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================ CLUSTERS -->
+      <section class="view" id="view-clusters">
+        <div class="pagehead">
+          <div>
+            <h1>Records needing a pack</h1>
+            <p>Unparsed records grouped into templates, highest volume first. Open <strong>Samples</strong> on a cluster to trace the individual events represented by it. Every record is still vaulted, fingerprinted and emitted as valid OCSF &mdash; "needs a pack" is a routing state, never data loss.</p>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:16px">
+          <div class="panel-head"><h2>Templates</h2><span class="sub" id="cl-overflow"></span></div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>Cluster</th><th class="num">Records</th><th>Template</th><th>Source assessment</th><th>Draft a pack</th></tr></thead>
+              <tbody id="clusters-body"><tr><td colspan="5" class="empty">No unparsed records. Every event so far was claimed by a pack.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" id="review-pane" hidden>
+          <div class="panel-head">
+            <h2>Candidate pack</h2>
+            <span class="sub" id="review-sub"></span>
+            <div class="right">
+              <span class="pill neutral" id="rev-fixtures">0/0 fixtures</span>
+              <span class="pill neutral" id="rev-accuracy">0% fields</span>
+              <span class="pill bad" id="rev-ocsf-warning" hidden></span>
+              <span class="pill warn" id="rev-edited" hidden>edited &middot; not yet revalidated</span>
+              <button class="btn sm" type="button" id="btn-revalidate" hidden>Validate</button>
+              <button class="btn sm" type="button" id="btn-revert" hidden>Revert to draft</button>
+              <button class="btn primary sm" type="button" id="btn-approve" hidden>Approve and deploy</button>
+              <button class="btn danger sm" type="button" id="btn-replace" hidden>Replace existing pack</button>
+            </div>
+          </div>
+          <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+            <div class="callout" id="rev-profile" hidden></div>
+            <div class="callout warn">
+              Format and source-family scores are evidence-based hypotheses, not ground truth. Fixture scores use these same samples, so they show self-consistency &mdash; not that the draft generalizes. Validate identity, activity and field meaning on held-out records before approval.
+            </div>
+            <div class="editnote muted">
+              This draft is editable. Correct the identity, the detector, the field
+              mapping or the fixtures, then <b>Validate</b> to re-run the checks
+              against your edit. Approval writes the pack into the live directory
+              and the watcher activates it, so it is refused unless every fixture
+              passes.
+            </div>
+            <textarea class="codebox packedit" id="rev-yaml" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="Candidate Source Pack YAML"></textarea>
+            <div class="callout" id="rev-validation" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================ PACKS -->
+      <section class="view" id="view-packs">
+        <div class="pagehead">
+          <div>
+            <h1>Source Packs</h1>
+            <p>Declarative YAML in the packs directory, compiled at load and hot-reloaded on change. Fixture results are shown here; console approval requires them to pass, while files copied directly into the directory still require operator review.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Installed</h2><span class="sub" id="packs-sub"></span></div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr>
+                <th>Pack</th><th>Vendor</th><th>Product</th><th>Decoder chain</th>
+                <th class="num">Priority</th><th class="num">Mapped</th><th>Fixtures</th><th class="num">Claimed</th>
+              </tr></thead>
+              <tbody id="packs-body"><tr><td colspan="8" class="empty">Loading&hellip;</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================ INTEGRITY -->
+      <section class="view" id="view-integrity">
+        <div class="pagehead">
+          <div>
+            <h1>Integrity</h1>
+            <p>Every event carries a fingerprint over its own canonical form plus a link to its predecessor, and the chain is anchored by Ed25519-signed checkpoints. Verification re-hashes the retained window and walks the links.</p>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="panel">
+            <div class="panel-head"><h2>Verify the chain</h2></div>
+            <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+              <p style="margin:0;color:var(--text-2);font-size:13px">
+                Recomputes each event's fingerprint from its content and checks that every
+                <span class="mono">prev_event</span> link matches the event before it.
+              </p>
+              <div><button class="btn primary" type="button" id="btn-verify">Run verification</button></div>
+              <div id="verify-out"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Tamper test</h2><span class="sub">alters the retained copy only</span></div>
+            <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+              <p style="margin:0;color:var(--text-2);font-size:13px">
+                Rewrites one attribute on one retained event, then verify again. The vault is
+                append-only and is not touched, so the original bytes stay retrievable and
+                provably different from the altered event.
+              </p>
+              <div class="rowline">
+                <label class="field" style="flex:0 0 92px">Event
+                  <input id="tamper-index" class="mono" type="number" min="0" value="0" title="Row number in the events table, newest first">
+                </label>
+                <label class="field" style="flex:1 1 170px">Attribute
+                  <input id="tamper-path" class="mono" value="src_endpoint.ip">
+                </label>
+                <label class="field" style="flex:1 1 150px">New value
+                  <input id="tamper-value" class="mono" value="203.0.113.66">
+                </label>
+              </div>
+              <div><button class="btn danger" type="button" id="btn-tamper">Alter this event</button></div>
+              <div id="tamper-out"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head"><h2>Check a proof</h2><span class="sub">paste one issued anywhere</span></div>
+          <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+            <p style="margin:0;color:var(--text-2);font-size:13px">
+              A proof carries the signed checkpoint it was made against, so it can be
+              checked long after the log has moved on. The signature is verified against
+              this collector's public key; altering the proof or the checkpoint inside it
+              fails here.
+            </p>
+            <textarea id="proof-input" class="mono" rows="6" style="width:100%"
+              placeholder="Paste a proof bundle (the JSON from Generate proof, or from ulpf prove)"></textarea>
+            <div><button class="btn primary" type="button" id="btn-check-pasted">Check this proof</button></div>
+            <div id="proof-check-out"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================ ASSISTANT -->
+      <section class="view" id="view-assistant">
+        <div class="pagehead">
+          <div>
+            <h1>Assistant</h1>
+            <p>A local model with live context: loaded packs, current coverage, unparsed clusters and recent events. Optional &mdash; the deterministic generator drafts packs without it.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Conversation</h2><span class="sub" id="chat-model">local model</span></div>
+          <div class="panel-body">
+            <div class="chat" id="chat-history">
+              <div class="msg bot">Ask about coverage, a pack, or paste a device log line and I will offer to draft a pack for it.</div>
+            </div>
+            <div class="rowline" style="margin-top:12px">
+              <textarea id="chat-input" rows="2" style="flex:1 1 320px" placeholder="Enter to send, Shift+Enter for a new line"></textarea>
+              <button class="btn primary" type="button" id="btn-chat">Send</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer" aria-label="Event detail">
+  <div class="drawer-head">
+    <h3>Event detail</h3>
+    <div style="margin-left:auto"><button class="btn sm" type="button" id="btn-close-drawer">Close</button></div>
+  </div>
+  <div class="drawer-body">
+    <div class="headline" id="d-headline"></div>
+
+    <details class="sect" open>
+      <summary>What this event says</summary>
+      <div class="sect-body"><dl class="kv" id="d-summary"></dl></div>
+    </details>
+
+    <details class="sect" open>
+      <summary>Where it came from</summary>
+      <div class="sect-body"><dl class="kv" id="d-source"></dl></div>
+    </details>
+
+    <details class="sect" id="d-sect-extra">
+      <summary>Fields with no OCSF home</summary>
+      <div class="sect-body"><dl class="kv" id="d-extra"></dl></div>
+    </details>
+
+    <details class="sect" open>
+      <summary>Original evidence</summary>
+      <div class="sect-body">
+        <dl class="kv" id="d-evidence"></dl>
+        <h4 style="margin-top:14px">Bytes retrieved from the vault</h4>
+        <pre class="codebox" id="d-raw"></pre>
+      </div>
+    </details>
+
+    <details class="sect" open>
+      <summary>Chain of custody</summary>
+      <div class="sect-body"><dl class="kv" id="d-chain"></dl></div>
+    </details>
+
+    <details class="sect" open>
+      <summary>Prove this event was logged</summary>
+      <div class="sect-body">
+        <p style="margin:0 0 10px;color:var(--text-2);font-size:13px">
+          Produces a short proof that this one record is in the signed log. Anyone
+          holding the proof and the public key can check it &mdash; without the vault,
+          the chain, or any other event.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn primary" type="button" id="btn-prove">Generate proof</button>
+          <button class="btn" type="button" id="btn-copy-proof" hidden>Copy proof</button>
+          <button class="btn" type="button" id="btn-check-proof" hidden>Check it</button>
+        </div>
+        <div id="d-proof-out" style="margin-top:11px"></div>
+        <pre class="codebox" id="d-proof-json" style="margin-top:10px;max-height:220px;overflow:auto" hidden></pre>
+      </div>
+    </details>
+
+    <details class="sect">
+      <summary>Full OCSF event</summary>
+      <div class="sect-body"><pre class="codebox" id="d-ocsf"></pre></div>
+    </details>
+
+    <details class="sect" open>
+      <summary>What all this means</summary>
+      <div class="sect-body"><div class="explain" id="d-explain"></div></div>
+    </details>
+
+    <details class="sect" open>
+      <summary>Ask the AI Copilot about this event</summary>
+      <div class="sect-body">
+        <div class="muted" style="font-size:12.5px">
+          The local model is given this event and answers questions about it.
+        </div>
+        <div class="ask-row">
+          <input id="d-ask" type="text" placeholder="e.g. why is this severity Medium?" autocomplete="off">
+          <button class="btn" type="button" id="btn-ask">Ask</button>
+        </div>
+        <div class="ask-log" id="d-ask-log"></div>
+      </div>
+    </details>
+  </div>
+</aside>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+/* ------------------------------------------------------------ navigation */
+function switchView(name) {
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
+  document.querySelectorAll(".navitem").forEach((b) => {
+    if (b.dataset.view === name) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
+  $("crumb").textContent = name.toUpperCase();
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+  $("rail").classList.remove("open");
+  // The flow diagram is laid out from its container's size, which is zero
+  // while the view is hidden. Redraw once it is on screen. Guarded because
+  // hash routing runs this before that section of the script is evaluated.
+  if (name === "rawlogs" && window.refreshRawFeed) window.refreshRawFeed();
+  if (name === "livemap" && window.flowDraw) requestAnimationFrame(window.flowDraw);
+  if (name === "analytics" && window.analyticsDraw) requestAnimationFrame(window.analyticsDraw);
+}
+document.querySelectorAll(".navitem").forEach((b) => {
+  b.addEventListener("click", () => switchView(b.dataset.view));
+});
+if (location.hash) {
+  const wanted = location.hash.slice(1);
+  if ($("view-" + wanted)) switchView(wanted);
+}
+
+/* --------------------------------------------------------------- helpers */
+/* Badge-sized rendering of a count that grows without bound. */
+function compactCount(n) {
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+  return (n / 1000000).toFixed(1) + "M";
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+}
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function pill(kind, text) {
+  const p = el("span", "pill " + kind);
+  p.append(el("i"), document.createTextNode(text));
+  return p;
+}
+/* ------------------------------------------------------- console auth token
+   Every /api/* route requires a bearer token unless the collector was started
+   with --no-auth (see crate::auth on the server side). The token is printed
+   once in the terminal at startup and never re-shown by the server, so it is
+   kept in this browser's localStorage for this origin only — it is attached
+   to requests back to this same console and nowhere else. */
+const ULPF_TOKEN_KEY = "ulpf_console_token";
+let ulpfPromptingForToken = false;
+
+function ulpfStoredToken() {
+  try { return localStorage.getItem(ULPF_TOKEN_KEY) || ""; } catch (e) { return ""; }
+}
+function ulpfAuthHeaders() {
+  const t = ulpfStoredToken();
+  return t ? { "Authorization": "Bearer " + t } : {};
+}
+/** Ask once for the token this collector printed at startup. The 2-second
+    poll and a user's own click can both hit a 401 at once; only the first
+    should open a prompt. */
+function ulpfAskForToken() {
+  if (ulpfPromptingForToken) return false;
+  ulpfPromptingForToken = true;
+  try {
+    const entered = window.prompt(
+      "This collector requires a console token.\n\n" +
+      "It was printed once in the terminal that ran `ulpf serve`, and saved to " +
+      "console.token inside the integrity directory.\n\nPaste it here:"
+    );
+    if (entered && entered.trim()) {
+      try { localStorage.setItem(ULPF_TOKEN_KEY, entered.trim()); } catch (e) { /* ignore */ }
+      return true;
+    }
+    return false;
+  } finally {
+    ulpfPromptingForToken = false;
+  }
+}
+/** Attach the token, retrying once through a prompt on a 401. Every caller
+    that talks to this console — the polling loop, a button click, the raw
+    fetches below — goes through this so there is exactly one place that
+    decides how a missing/expired token is handled. */
+async function authedFetch(path, options) {
+  options = options || {};
+  options.headers = Object.assign({}, options.headers, ulpfAuthHeaders());
+  let res = await fetch(path, options);
+  if (res.status === 401 && ulpfAskForToken()) {
+    options.headers = Object.assign({}, options.headers, ulpfAuthHeaders());
+    res = await fetch(path, options);
+  }
+  return res;
+}
+/** Every response is checked; a failed fetch must never be reported as success. */
+async function api(path, options) {
+  const res = await authedFetch(path, options);
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const detail = (body && body.error) ? body.error : (res.statusText || ("HTTP " + res.status));
+    throw new Error(detail);
+  }
+  return body;
+}
+function postJson(path, payload) {
+  return api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload === undefined ? {} : payload),
+  });
+}
+
+/* ----------------------------------------------------------- event table */
+let latestEvents = [];
+
+function classLabel(row) {
+  const d = String(row.disposition || "");
+  if (d.startsWith("unidentified")) return "Awaiting pack";
+  const c = row.class_uid, a = row.activity_id;
+  if (c === null || c === undefined) return "—";
+  return c + (a === null || a === undefined ? "" : "/" + a);
+}
+function statusPill(row) {
+  const d = String(row.disposition || "");
+  if (d === "parsed") return pill("ok", "normalized");
+  if (d.startsWith("unidentified")) return pill("warn", "needs a pack");
+  return pill("bad", d.length > 34 ? d.slice(0, 34) + "…" : d);
+}
+function renderEvents(rows) {
+  latestEvents = rows;
+  const body = $("events-body");
+  body.replaceChildren();
+  // Same shape as the raw feed: this is the collector's 500-event ring, so
+  // the count pins at 500 under sustained traffic. "Most recent" already says
+  // it is a window rather than a total; naming the total as well means the
+  // pill never has to be read against the tile above it to make sense.
+  $("ev-count").textContent = !rows.length
+    ? "no events yet"
+    : lastTotalReceived > rows.length
+      ? "most recent " + rows.length.toLocaleString()
+        + " of " + lastTotalReceived.toLocaleString()
+      : "most recent " + rows.length.toLocaleString();
+  if (!rows.length) {
+    const tr = el("tr");
+    const td = el("td", "empty", "No events yet. Open the traffic simulator, or point a device at the syslog receiver.");
+    td.colSpan = 7;
+    tr.append(td);
+    body.append(tr);
+    return;
+  }
+  rows.slice(0, 200).forEach((row, index) => {
+    const tr = el("tr", "clickable");
+    tr.append(el("td", "mono", fmtTime(row.time) || "—"));
+    const unidentified = String(row.disposition || "").startsWith("unidentified");
+    const vendor = unidentified
+      ? "Unidentified source"
+      : [row.vendor, row.product].filter(Boolean).join(" ");
+    tr.append(el("td", null, vendor || "—"));
+    tr.append(el("td", "mono", classLabel(row)));
+    tr.append(el("td", "mono", row.src_ip ? row.src_ip + (row.src_port ? ":" + row.src_port : "") : "—"));
+    tr.append(el("td", "mono", row.dst_ip ? row.dst_ip + (row.dst_port ? ":" + row.dst_port : "") : "—"));
+    tr.append(el("td", "mono", row.pack || "—"));
+    const st = el("td");
+    st.append(statusPill(row));
+    tr.append(st);
+    tr.addEventListener("click", () => openDrawer(index, row));
+    body.append(tr);
+  });
+}
+
+/* ------------------------------------------------------------- raw logs
+   The evidence view, and the first thing to show someone: what the device
+   actually wrote, before ULPF had an opinion about it.
+
+   Every line rendered here came back out of the vault via `/api/raw-feed`,
+   which resolves each event's locator against the append-only store. That is
+   deliberate. Echoing the bytes the pipeline was handed would prove nothing;
+   retrieving them by locator is the same operation an investigator performs
+   later, and it is what makes "nothing is discarded" checkable rather than
+   asserted.
+
+   The feed is only polled while this view is on screen. Retrieval is real file
+   I/O against the vault, and paying for it on every 2s tick behind a view
+   nobody is looking at would be a self-inflicted throughput cost. */
+let rawRecords = [];
+let rawTotalReceived = 0;  // the real count behind the window, from the API
+let lastTotalReceived = 0; // total received, for windows that report a page
+let rawSelected = null;   // locator of the selected record, not an index:
+                          // the list is a moving window and indices shift.
+
+function rawViewActive() {
+  const view = $("view-rawlogs");
+  return view && view.classList.contains("active");
+}
+
+function renderRawList() {
+  const list = $("raw-list");
+  // This list is a page off the end of a moving window, not a population. It
+  // asks for 200 and the collector keeps 500, so once 200 records have ever
+  // arrived the length is 200 for the rest of the session -- and reading
+  // "200 records" as a count is then simply wrong. Say what it is: the newest
+  // N, out of however many have really been received.
+  $("raw-count").textContent = !rawRecords.length
+    ? "no records yet"
+    : rawTotalReceived > rawRecords.length
+      ? "newest " + rawRecords.length.toLocaleString()
+        + " of " + rawTotalReceived.toLocaleString() + " received"
+      : rawRecords.length.toLocaleString()
+        + (rawRecords.length === 1 ? " record" : " records");
+  $("tally-raw").textContent = compactCount(rawRecords.length);
+
+  if (!rawRecords.length) {
+    const empty = el("div", "empty", "No records yet. Turn a source on in the traffic simulator.");
+    empty.style.padding = "22px";
+    list.replaceChildren(empty);
+    return;
+  }
+
+  const rows = rawRecords.map((rec) => {
+    const row = el("button", "rawrow");
+    row.type = "button";
+    if (rec.locator === rawSelected) row.setAttribute("aria-current", "true");
+
+    const top = el("div", "rawtop");
+    top.append(el("b", null, [rec.vendor, rec.product].filter(Boolean).join(" ") || "unidentified"));
+    top.append(el("span", null, fmtTime(rec.time) || "—"));
+    if (rec.pack) top.append(el("span", null, rec.pack));
+    top.append(el("span", null, rec.bytes != null ? rec.bytes + " B" : ""));
+    row.append(top);
+
+    // `error` means the bytes could not be retrieved. Say so on the row rather
+    // than dropping it: a missing original is precisely what an operator needs
+    // to see, and a silently shorter list would hide it.
+    row.append(el("div", "rawline", rec.error ? "[unretrievable: " + rec.error + "]" : rec.raw));
+    row.addEventListener("click", () => selectRaw(rec.locator));
+    return row;
+  });
+  list.replaceChildren(...rows);
+}
+
+function selectRaw(locator) {
+  rawSelected = locator;
+  const rec = rawRecords.find((r) => r.locator === locator);
+  renderRawList();
+  if (!rec) return;
+
+  $("raw-sub").textContent = rec.pack ? "claimed by " + rec.pack : "no pack claimed this record";
+  $("raw-detail").textContent = rec.error
+    ? "The vault could not return this record: " + rec.error
+    : rec.raw;
+
+  // The whole point of the view: the bytes just retrieved still hash to the
+  // fingerprint taken at ingest. `verified` is null where the event recorded
+  // no raw hash to compare against, which is a different answer from false.
+  const pill = $("raw-verify-pill");
+  if (rec.verified === true) {
+    pill.hidden = false;
+    pill.className = "pill ok";
+    pill.replaceChildren(el("i"), document.createTextNode("matches ingest fingerprint"));
+  } else if (rec.verified === false) {
+    pill.hidden = false;
+    pill.className = "pill bad";
+    pill.replaceChildren(el("i"), document.createTextNode("FINGERPRINT MISMATCH"));
+  } else {
+    pill.hidden = true;
+  }
+
+  const meta = $("raw-meta");
+  meta.replaceChildren();
+  const pairs = [
+    ["Vault locator", rec.locator],
+    ["Bytes", rec.bytes != null ? rec.bytes.toLocaleString() : "—"],
+    ["Transport", rec.transport || "—"],
+    ["Origin", rec.origin || "—"],
+    ["Wire format", rec.log_format || "—"],
+    ["Hash at ingest", rec.recorded_hash || "—"],
+    ["Hash recomputed now", rec.recomputed_hash || "—"],
+  ];
+  pairs.forEach(([k, v]) => {
+    meta.append(el("dt", null, k));
+    meta.append(el("dd", null, v));
+  });
+  meta.hidden = false;
+
+  // Hand the operator the other half of the story. The events feed is the same
+  // 500-record window, so the matching normalized event is found by uid.
+  const jump = $("btn-raw-normalized");
+  jump.hidden = false;
+  // The record carries its own normalized event, so this always resolves --
+  // even for a record that has already aged out of the live events window.
+  jump.onclick = () => openDrawer(0, { event: rec.event, locator: rec.locator });
+}
+
+async function refreshRawFeed() {
+  try {
+    const data = await api("/api/raw-feed?limit=200");
+    rawRecords = data.records || [];
+    rawTotalReceived = Number(data.total_received) || 0;
+  } catch (e) {
+    return;   // the shared refresh loop already surfaces connectivity
+  }
+  renderRawList();
+  // Keep the selection pinned across refreshes; only re-render the detail
+  // pane if the selected record is still in the window.
+  if (rawSelected && rawRecords.some((r) => r.locator === rawSelected)) {
+    selectRaw(rawSelected);
+  } else if ($("raw-follow").checked && rawRecords.length && !rawSelected) {
+    selectRaw(rawRecords[0].locator);
+  }
+}
+
+window.refreshRawFeed = refreshRawFeed;
+
+/* Refresh was wired correctly and still read as broken. With "Follow live" on,
+   the two-second poll already refreshes this list, so a click landed on a list
+   about to change anyway; with it off, the fetch happened silently. Say what
+   happened instead. */
+const rawRefreshBtn = $("btn-raw-refresh");
+const rawRefreshLabel = rawRefreshBtn.textContent;
+let rawRefreshTimer = 0;
+
+function syncRawRefreshButton() {
+  if (rawRefreshTimer) return;   // mid-confirmation, leave the message up
+  const following = $("raw-follow").checked;
+  rawRefreshBtn.disabled = following;
+  rawRefreshBtn.textContent = following ? "Following live" : rawRefreshLabel;
+  rawRefreshBtn.title = following
+    ? "This list already updates every two seconds. Turn off Follow live to refresh it by hand."
+    : "Fetch the newest records now";
+}
+
+rawRefreshBtn.addEventListener("click", async () => {
+  const before = rawRecords.length ? rawRecords[0].locator : null;
+  rawRefreshBtn.disabled = true;
+  rawRefreshBtn.textContent = "Refreshing…";
+  await refreshRawFeed();
+  const after = rawRecords.length ? rawRecords[0].locator : null;
+  rawRefreshBtn.textContent = after && after !== before ? "Updated" : "No new records";
+  window.clearTimeout(rawRefreshTimer);
+  rawRefreshTimer = window.setTimeout(() => {
+    rawRefreshTimer = 0;
+    syncRawRefreshButton();
+  }, 1400);
+});
+
+$("raw-follow").addEventListener("change", () => {
+  syncRawRefreshButton();
+  if ($("raw-follow").checked) refreshRawFeed();
+});
+syncRawRefreshButton();
+
+/* --------------------------------------------------------------- drawer */
+/* Enum captions below are taken from the OCSF 1.9.0 schema vendored in
+   schema/ocsf, not from memory:
+     severity_id                  schema/ocsf/dictionary.json
+     fingerprint.algorithm_id     schema/ocsf/objects/fingerprint.json
+     fingerprint.encoding_id      schema/ocsf/objects/fingerprint.json
+     fingerprint.serialization_id schema/ocsf/objects/fingerprint.json
+     network_activity.activity_id schema/ocsf/events/network/network_activity.json
+     finding.activity_id          schema/ocsf/events/findings/finding.json
+     categories                   schema/ocsf/categories.json
+   Observable type ids come from ObservableType in crates/ulpf-ocsf/src/types.rs,
+   which is what this collector actually emits.
+   Anything not listed is rendered as the bare number rather than guessed at. */
+const SEVERITY = {0:"Unknown",1:"Informational",2:"Low",3:"Medium",4:"High",5:"Critical",6:"Fatal",99:"Other"};
+const HASH_ALG = {0:"Unknown",1:"MD5",2:"SHA-1",3:"SHA-256",4:"SHA-512",5:"CTPH",6:"TLSH",8:"SHA-224",9:"SHA-384",99:"Other"};
+const ENCODING = {0:"Unknown",1:"Hex",2:"Base64",3:"Base64URL",99:"Other"};
+const SERIALIZATION = {0:"Unknown",1:"Flat",2:"JCS",3:"JWS",4:"COSE",5:"DSSE",99:"Other"};
+const CATEGORY = {1:"System Activity",2:"Findings",3:"Identity & Access Management",4:"Network Activity",
+                  5:"Discovery",6:"Application Activity",7:"Remediation",8:"Unmanned Systems"};
+const CLASS_NAME = {0:"Base Event",1008:"Event Log Activity",2001:"Security Finding",2004:"Detection Finding",
+                   3002:"Authentication",4001:"Network Activity",4002:"HTTP Activity",
+                   4009:"Email Activity",6003:"API Activity"};
+/* activity_id is class-specific. Every table below is copied from the class's
+   own file under schema/ocsf/events/; 2001 and 2004 inherit theirs from
+   findings/finding.json. A class absent from this table renders its bare
+   activity number rather than a guessed caption. */
+const ACTIVITY = {
+  1008:{1:"Clear",2:"Delete",3:"Export",4:"Archive",5:"Rotate",6:"Start",7:"Stop",8:"Restart",
+        9:"Enable",10:"Disable"},
+  2001:{1:"Create",2:"Update",3:"Close"},
+  2004:{1:"Create",2:"Update",3:"Close"},
+  3002:{1:"Logon",2:"Logoff",3:"Authentication Ticket",4:"Service Ticket Request",
+        5:"Service Ticket Renew",6:"Preauth",7:"Account Switch"},
+  4001:{1:"Open",2:"Close",3:"Reset",4:"Fail",5:"Refuse",6:"Traffic",7:"Listen"},
+  4002:{1:"Connect",2:"Delete",3:"Get",4:"Head",5:"Options",6:"Post",7:"Put",8:"Trace",9:"Patch"},
+  4009:{1:"Send",2:"Receive",3:"Scan",4:"Trace",5:"MTA Relay"},
+  6003:{1:"Create",2:"Read",3:"Update",4:"Delete"}
+};
+const OBSERVABLE = {1:"Hostname",2:"IP address",3:"MAC address",4:"User name",5:"Email",
+                    6:"URL",8:"Domain name",11:"Port",30:"Fingerprint"};
+
+let drawerEvent = null;
+
+const label = (table, id) => (table[id] !== undefined ? table[id] : null);
+
+/* `caption (id)` when the schema names the value, otherwise the bare id. Never
+   invents a caption for a value the schema does not define. */
+function idWithName(table, id) {
+  if (id === undefined || id === null) return null;
+  const name = label(table, id);
+  return name ? name + " (" + id + ")" : String(id);
+}
+
+function row(dl, term, value, note) {
+  if (value === null || value === undefined || value === "") return;
+  const dt = document.createElement("dt");
+  dt.textContent = term;
+  const dd = document.createElement("dd");
+  dd.textContent = value;
+  if (note) {
+    const em = document.createElement("em");
+    em.textContent = "  " + note;
+    dd.appendChild(em);
+  }
+  dl.append(dt, dd);
+}
+
+function get(obj, path) {
+  return path.split(".").reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj);
+}
+
+function fmtTime(nanos) {
+  if (typeof nanos !== "number") return null;
+  /* OCSF `time` is carried here in nanoseconds; Date takes milliseconds. */
+  const d = new Date(nanos / 1e6);
+  return isNaN(d.getTime()) ? null : d.toISOString().replace("T", " ").replace("Z", " UTC");
+}
+
+/* One plain sentence, built only from fields this event actually has. */
+function isUnidentifiedEvent(ev) {
+  return get(ev, "unmapped.ulpf_disposition") === "unidentified";
+}
+
+function headlineFor(ev) {
+  if (isUnidentifiedEvent(ev)) {
+    return "Unidentified source sent a log that no Source Pack recognizes yet — preserved and queued for onboarding.";
+  }
+  const cls = ev.class_uid;
+  const className = label(CLASS_NAME, cls) || ("class " + cls);
+  const act = ACTIVITY[cls] ? label(ACTIVITY[cls], ev.activity_id) : null;
+  const src = get(ev, "src_endpoint.ip");
+  const dst = get(ev, "dst_endpoint.ip");
+  const sev = label(SEVERITY, ev.severity_id);
+  const vendor = get(ev, "metadata.product.vendor_name");
+  const product = get(ev, "metadata.product.name");
+
+  const bits = [];
+  bits.push(vendor && product ? vendor + " " + product : "A device");
+  bits.push("reported");
+  bits.push(act ? "a " + className.toLowerCase() + " (" + act.toLowerCase() + ")"
+                : "a " + className.toLowerCase());
+  if (src && dst) bits.push("from " + src + " to " + dst);
+  else if (src) bits.push("from " + src);
+  else if (dst) bits.push("to " + dst);
+  if (sev) bits.push("— severity " + sev.toLowerCase());
+  return bits.join(" ") + ".";
+}
+
+function fillSummary(ev) {
+  const dl = $("d-summary");
+  dl.replaceChildren();
+  row(dl, "Event class", idWithName(CLASS_NAME, ev.class_uid), "what kind of thing this is");
+  row(dl, "Category", idWithName(CATEGORY, ev.category_uid));
+  const acts = ACTIVITY[ev.class_uid];
+  row(dl, "Activity", acts ? idWithName(acts, ev.activity_id)
+                           : (ev.activity_id !== undefined ? String(ev.activity_id) : null));
+  row(dl, "Type", ev.type_uid, "class x 100 + activity");
+  row(dl, "Severity", idWithName(SEVERITY, ev.severity_id));
+  row(dl, "Time", fmtTime(ev.time));
+  if (ev.message) row(dl, "Message", ev.message);
+  if (get(ev, "finding_info.title")) row(dl, "Finding", get(ev, "finding_info.title"));
+  if (get(ev, "finding_info.uid")) row(dl, "Rule id", get(ev, "finding_info.uid"));
+  if (ev.is_alert !== undefined) row(dl, "Is alert", String(ev.is_alert));
+  row(dl, "Source IP", get(ev, "src_endpoint.ip"));
+  row(dl, "Source port", get(ev, "src_endpoint.port"));
+  row(dl, "Destination IP", get(ev, "dst_endpoint.ip"));
+  row(dl, "Destination port", get(ev, "dst_endpoint.port"));
+  row(dl, "Protocol", get(ev, "connection_info.protocol_name"));
+  row(dl, "Device", get(ev, "device.hostname"));
+
+  if (Array.isArray(ev.observables) && ev.observables.length) {
+    const dt = document.createElement("dt");
+    dt.textContent = "Observables";
+    const dd = document.createElement("dd");
+    dd.textContent = ev.observables
+      .map((o) => (label(OBSERVABLE, o.type_id) || ("type " + o.type_id)) + ": " + o.value)
+      .join("\n");
+    dl.append(dt, dd);
+  }
+
+  // Salvage recovers indicators from a record no pack mapped. Saying so
+  // matters: without it the observables above look like a pack's work, and the
+  // one thing worth noticing here is that they are not — this record came from
+  // a source nobody has onboarded and is searchable anyway.
+  const salvaged = get(ev, "unmapped.ulpf_salvaged_count");
+  if (salvaged) {
+    const dt = document.createElement("dt");
+    dt.textContent = "Recovered";
+    const dd = document.createElement("dd");
+    dd.append(el("span", "pill warn", salvaged + " by salvage"));
+    const note = el("div", "sub");
+    note.style.marginTop = "4px";
+    note.textContent =
+      "Read out of the raw text without a pack. Indicators only — ULPF reports " +
+      "that an address is present, never that it is the source.";
+    dd.append(note);
+    dl.append(dt, dd);
+  }
+}
+
+function fillSource(ev) {
+  const dl = $("d-source");
+  dl.replaceChildren();
+  const unidentified = isUnidentifiedEvent(ev);
+  row(dl, "Vendor", unidentified ? "Not identified yet" : get(ev, "metadata.product.vendor_name"));
+  row(dl, "Product", unidentified ? "Not identified yet" : get(ev, "metadata.product.name"));
+  row(dl, "Source pack", unidentified ? "None — awaiting onboarding" : get(ev, "metadata.log_provider"), "the parser that claimed it");
+  row(dl, "Log format", get(ev, "metadata.log_format"));
+  row(dl, "OCSF version", get(ev, "metadata.version"));
+  row(dl, "Event id", get(ev, "metadata.uid"));
+  row(dl, "Received", fmtTime(get(ev, "metadata.logged_time")));
+  row(dl, "Normalized", fmtTime(get(ev, "metadata.processed_time")));
+  const rc = get(ev, "unmapped.ulpf_receipt");
+  if (rc) {
+    row(dl, "Transport", rc.transport);
+    row(dl, "Peer", rc.peer);
+    row(dl, "Receiver", rc.receiver_id);
+  }
+  const profiles = get(ev, "metadata.profiles");
+  if (Array.isArray(profiles) && profiles.length) row(dl, "Profiles", profiles.join(", "));
+}
+
+/* Everything under `unmapped` except ULPF's own bookkeeping, which appears in
+   the evidence and custody sections instead. */
+function fillExtra(ev) {
+  const dl = $("d-extra");
+  dl.replaceChildren();
+  const um = ev.unmapped || {};
+  const keys = Object.keys(um).filter((k) => k !== "ulpf_raw_locator" && k !== "ulpf_receipt");
+  for (const k of keys.sort()) {
+    const v = um[k];
+    row(dl, k, typeof v === "object" ? JSON.stringify(v) : String(v));
+  }
+  $("d-sect-extra").style.display = keys.length ? "" : "none";
+  const sum = $("d-sect-extra").querySelector("summary");
+  if (sum) sum.textContent = "Fields with no OCSF home (" + keys.length + ")";
+}
+
+function fillEvidence(ev, locator) {
+  const dl = $("d-evidence");
+  dl.replaceChildren();
+  row(dl, "Vault locator", locator || get(ev, "unmapped.ulpf_raw_locator"));
+  row(dl, "Original size", ev.raw_data_size !== undefined ? ev.raw_data_size + " bytes" : null);
+  const h = ev.raw_data_hash;
+  if (h) {
+    row(dl, "Hash of the bytes", h.value);
+    row(dl, "Hash algorithm", idWithName(HASH_ALG, h.algorithm_id));
+    row(dl, "Encoding", idWithName(ENCODING, h.encoding_id));
+    row(dl, "Serialization", idWithName(SERIALIZATION, h.serialization_id),
+        h.serialization_id === 1 ? "hashed as raw bytes" : null);
+  }
+}
+
+function fillChain(ev) {
+  const dl = $("d-chain");
+  dl.replaceChildren();
+  const att = Array.isArray(ev.attestation_list) ? ev.attestation_list[0] : null;
+  if (!att) { row(dl, "Attestation", "none on this event"); return; }
+  row(dl, "Authority", att.authority_uid);
+  row(dl, "Chain", att.chain_uid);
+  if (att.fingerprint) {
+    row(dl, "Fingerprint", att.fingerprint.value);
+    row(dl, "Algorithm", idWithName(HASH_ALG, att.fingerprint.algorithm_id));
+    row(dl, "Serialization", idWithName(SERIALIZATION, att.fingerprint.serialization_id),
+        att.fingerprint.serialization_id === 2 ? "canonical JSON, RFC 8785" : null);
+  }
+  if (att.prev_event) {
+    row(dl, "Previous event", att.prev_event.uid);
+    if (att.prev_event.fingerprint) row(dl, "Its fingerprint", att.prev_event.fingerprint.value);
+  } else {
+    row(dl, "Previous event", "none — first event in this chain");
+  }
+}
+
+/* The explanation. Every claim is either a fact about OCSF taken from the
+   vendored schema, or a fact about this specific event read off the object. */
+function fillExplain(ev) {
+  const box = $("d-explain");
+  box.replaceChildren();
+
+  const add = (html) => {
+    const p = document.createElement("p");
+    p.innerHTML = html;
+    box.appendChild(p);
+  };
+  const esc = (v) => String(v).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  const cls = ev.class_uid;
+  const className = label(CLASS_NAME, cls);
+  const cat = label(CATEGORY, ev.category_uid);
+  const acts = ACTIVITY[cls];
+  const actName = acts ? label(acts, ev.activity_id) : null;
+  const sev = label(SEVERITY, ev.severity_id);
+  const pack = get(ev, "metadata.log_provider");
+  const fmt = get(ev, "metadata.log_format");
+
+  const unidentified = isUnidentifiedEvent(ev);
+  if (unidentified) {
+    add("This is <b>not an extra event and not a successful translation</b>. It is the lossless fallback record "
+      + "for the original log shown above. No Source Pack recognized the format, so ULPF preserved the exact "
+      + "bytes, marked the record <code>unidentified</code>, queued its template under <b>Needs a pack</b>, "
+      + "and attached integrity evidence without inventing field meanings.");
+  } else {
+    add("This device sent a line of text in its own format. ULPF stored those exact bytes, worked out "
+      + "which device it came from, translated the fields into one shared vocabulary called <b>OCSF</b>, "
+      + "and attached a tamper-evident seal. The panels above are that result.");
+  }
+
+  if (pack) {
+    add("<b>Which parser claimed it.</b> The <code>" + esc(pack) + "</code> source pack recognised the line"
+      + (fmt ? " and read it as <code>" + esc(fmt) + "</code>" : "")
+      + ". A pack is a YAML file describing how to spot that vendor's format and where each field belongs, "
+      + "so adding a new device means writing one of those rather than changing the program.");
+  }
+
+  if (className && cat) {
+    add("<b>What it is.</b> <code>class_uid " + cls + "</code> is <b>" + esc(className) + "</b>, inside the "
+      + "<b>" + esc(cat) + "</b> category (<code>category_uid " + ev.category_uid + "</code>). That "
+      + "classification is what lets one query cross vendors: a Snort alert and a FortiGate record answer "
+      + "the same search even though the original text looks nothing alike.");
+  }
+
+  if (actName) {
+    add("<b>What happened.</b> <code>activity_id " + ev.activity_id + "</code> means <b>" + esc(actName)
+      + "</b> for this class. <code>type_uid " + ev.type_uid + "</code> is the class and the activity "
+      + "combined into one number (" + cls + " x 100 + " + ev.activity_id + "), so a query can match one "
+      + "field instead of two.");
+  }
+
+  if (sev) {
+    if (unidentified) {
+      add("<b>Severity is not known yet.</b> Because no Source Pack interpreted this line, "
+        + "<code>severity_id " + ev.severity_id + "</code> is the fallback record's neutral <b>" + esc(sev)
+        + "</b> value. It is not a claim that the device reported this severity. The eventual Source Pack must "
+        + "map <code>SEV1</code> using verified vendor semantics.");
+    } else {
+      add("<b>How serious.</b> <code>severity_id " + ev.severity_id + "</code> is <b>" + esc(sev)
+        + "</b> on the OCSF scale: 0 Unknown, 1 Informational, 2 Low, 3 Medium, 4 High, 5 Critical, 6 Fatal. "
+        + "It is derived from what the device itself reported, mapped onto that scale by the source pack "
+        + "— ULPF does not invent a severity of its own.");
+    }
+  }
+
+  const um = ev.unmapped || {};
+  const extras = Object.keys(um).filter((k) => k !== "ulpf_raw_locator" && k !== "ulpf_receipt");
+  if (extras.length) {
+    add("<b>Nothing is thrown away.</b> " + extras.length + " field"
+      + (extras.length === 1 ? "" : "s") + " on this line "
+      + (extras.length === 1 ? "has" : "have") + " no standard OCSF home — "
+      + esc(extras.slice(0, 6).join(", ")) + (extras.length > 6 ? ", and others" : "")
+      + ". Most tools discard whatever they have no slot for; these are kept under <code>unmapped</code> "
+      + "so the record stays complete.");
+  }
+
+  const h = ev.raw_data_hash;
+  if (h) {
+    const alg = label(HASH_ALG, h.algorithm_id);
+    add("<b>Proof the original text is unchanged.</b> <code>raw_data_hash</code> is "
+      + (alg ? "a <b>" + esc(alg) + "</b> hash" : "a hash")
+      + " of the original bytes, which are held in the vault at the locator above. Re-read those bytes, "
+      + "hash them again, and the value must match. Change one character and the hash changes completely, "
+      + "so any edit to the stored evidence is detectable.");
+  }
+
+  const att = Array.isArray(ev.attestation_list) ? ev.attestation_list[0] : null;
+  if (att && att.fingerprint) {
+    const ser = label(SERIALIZATION, att.fingerprint.serialization_id);
+    add("<b>Proof this record is unchanged, and in order.</b> The attestation <code>fingerprint</code> "
+      + "covers the whole normalized event"
+      + (ser === "JCS"
+          ? ", written in the canonical JSON form defined by RFC 8785 so the same event always produces "
+            + "the same bytes to hash"
+          : "")
+      + ". "
+      + (att.prev_event
+          ? "It also carries <code>prev_event</code>, the fingerprint of the record before it, so each "
+            + "event seals the one before. Removing or reordering any record breaks the links from that "
+            + "point onward."
+          : "This is the first event in its chain, so there is no predecessor to point at yet.")
+      + " Periodically the collector signs the current head of the chain with an Ed25519 key, so rewriting "
+      + "history would mean forging a signature rather than just recomputing hashes.");
+  }
+
+  add("<b>Why this matters.</b> A normalized record is only useful in an investigation if you can still "
+    + "show what the device originally said. The locator leads back to the untouched bytes, the hash proves "
+    + "they have not been edited, and the chain proves this record has not been swapped out or removed. "
+    + "That is the difference between a tidy log and evidence.");
+}
+
+async function openDrawer(index, row) {
+  drawerEvent = row.event || null;
+  $("backdrop").classList.add("open");
+  $("drawer").classList.add("open");
+  $("d-ask-log").replaceChildren();
+  $("d-ask").value = "";
+  currentProof = null;
+  currentProofText = null;
+  $("d-proof-out").replaceChildren();
+  $("d-proof-json").hidden = true;
+  $("btn-copy-proof").hidden = true;
+  $("btn-check-proof").hidden = true;
+
+  const ev = row.event || {};
+  $("d-headline").textContent = headlineFor(ev);
+  fillSummary(ev);
+  fillSource(ev);
+  fillExtra(ev);
+  fillEvidence(ev, row.locator);
+  fillChain(ev);
+  fillExplain(ev);
+  $("d-ocsf").textContent = JSON.stringify(ev, null, 2);
+
+  $("d-raw").textContent = "Retrieving from the vault…";
+  if (!row.locator) { $("d-raw").textContent = "No locator on this event."; return; }
+  try {
+    const data = await api("/api/raw/" + encodeURIComponent(row.locator));
+    $("d-raw").textContent = data.text + "\n\n— " + data.bytes + " bytes, recomputed hash "
+      + data.recomputed_hash;
+  } catch (e) {
+    $("d-raw").textContent = "Could not retrieve the original bytes: " + e.message;
+  }
+}
+
+/* Ask the local model about the event on screen. The event travels with the
+   question, so the answer is about this record rather than the stream at large. */
+async function askAboutEvent() {
+  const q = $("d-ask").value.trim();
+  if (!q || !drawerEvent) return;
+  $("d-ask").value = "";
+  const log = $("d-ask-log");
+
+  const qEl = document.createElement("div");
+  qEl.className = "ask-q";
+  qEl.textContent = q;
+  log.appendChild(qEl);
+
+  const aEl = document.createElement("div");
+  aEl.className = "ask-a";
+  aEl.textContent = "Thinking…";
+  log.appendChild(aEl);
+  aEl.scrollIntoView({ block: "nearest" });
+
+  $("btn-ask").disabled = true;
+  try {
+    const res = await authedFetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{
+          role: "user",
+          content:
+            "Here is one normalized OCSF event from the collector:\n\n"
+            + JSON.stringify(drawerEvent, null, 2)
+            + "\n\nAnswer this question about that event. If the event does not contain the "
+            + "information needed, say so rather than guessing.\n\nQuestion: " + q
+        }]
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    aEl.textContent = res.ok
+      ? (data.reply || "The model returned an empty answer.")
+      : (data.error || "Request failed (HTTP " + res.status + ")");
+  } catch (e) {
+    aEl.textContent = "Could not reach the console: " + e.message;
+  } finally {
+    $("btn-ask").disabled = false;
+    aEl.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function closeDrawer() {
+  $("backdrop").classList.remove("open");
+  $("drawer").classList.remove("open");
+}
+
+/* ----------------------------------------------------------- proofs */
+/* A proof says "this one record was in the signed log" in a few hundred bytes,
+   and can be checked by someone holding nothing but the proof and a public
+   key. The bundle carries the checkpoint it was made against, because the
+   collector overwrites its checkpoint every few seconds and a proof naming a
+   checkpoint that no longer exists would be worthless. */
+let currentProof = null;
+let currentProofText = null;
+
+function proofNote(kind, lines) {
+  const box = document.createElement("div");
+  box.className = "callout " + kind;
+  for (const line of lines) {
+    const row = document.createElement("div");
+    row.textContent = line;
+    box.appendChild(row);
+  }
+  return box;
+}
+
+function currentFingerprint() {
+  const att = drawerEvent && Array.isArray(drawerEvent.attestation_list)
+    ? drawerEvent.attestation_list[0]
+    : null;
+  return att && att.fingerprint ? att.fingerprint.value : null;
+}
+
+async function generateProof() {
+  const fingerprint = currentFingerprint();
+  const out = $("d-proof-out");
+  if (!fingerprint) {
+    out.replaceChildren(proofNote("bad", ["This event carries no attestation, so it cannot be proved."]));
+    return;
+  }
+
+  $("btn-prove").disabled = true;
+  out.replaceChildren(proofNote("info", ["Signing a checkpoint and building the proof..."]));
+  try {
+    const res = await authedFetch("/api/proof", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fingerprint: fingerprint,
+        event_uid: (drawerEvent.metadata || {}).uid || null,
+      }),
+    });
+    // The body IS the bundle, kept as text. A checkpoint's created_time is
+    // nanoseconds, past the 2^53 a JavaScript number holds exactly, so any
+    // parse-and-re-serialize rounds it and the signature stops matching. The
+    // text is what gets shown, copied and posted back; the parsed copy is used
+    // only for small fields that are safe to read.
+    const text = await res.text();
+    if (!res.ok) {
+      let msg = "Request failed (HTTP " + res.status + ")";
+      try { msg = JSON.parse(text).error || msg; } catch (e) { /* not JSON */ }
+      out.replaceChildren(proofNote("bad", [msg]));
+      return;
+    }
+
+    currentProofText = text;
+    currentProof = JSON.parse(text);
+    const keyPath = res.headers.get("x-ulpf-public-key") || "the collector's public key";
+    out.replaceChildren(proofNote("info", [
+      "Proof for event " + (currentProof.leaf_index + 1) + " of " + currentProof.tree_size + ".",
+      currentProof.path.length + " sibling hashes, " + currentProof.path.length * 32 + " bytes of path.",
+      "Verify elsewhere with: ulpf verify-proof --proof proof.json --public-key " + keyPath,
+    ]));
+    const pre = $("d-proof-json");
+    pre.textContent = text;
+    pre.hidden = false;
+    $("btn-copy-proof").hidden = false;
+    $("btn-check-proof").hidden = false;
+  } catch (e) {
+    out.replaceChildren(proofNote("bad", ["Could not reach the console: " + e.message]));
+  } finally {
+    $("btn-prove").disabled = false;
+  }
+}
+
+async function copyProof() {
+  if (!currentProofText) return;
+  // The server's exact bytes, never a re-serialized copy.
+  const text = currentProofText;
+  try {
+    await navigator.clipboard.writeText(text);
+    $("btn-copy-proof").textContent = "Copied";
+    setTimeout(() => { $("btn-copy-proof").textContent = "Copy proof"; }, 1500);
+  } catch (e) {
+    // Clipboard access can be refused; the JSON is on screen either way.
+    $("btn-copy-proof").textContent = "Select it above";
+    setTimeout(() => { $("btn-copy-proof").textContent = "Copy proof"; }, 2000);
+  }
+}
+
+/* Render a verified outcome. Shared by the drawer and the paste box so the two
+   cannot describe the same result differently. */
+function renderProofOutcome(target, data, ok) {
+  if (!ok) {
+    target.replaceChildren(proofNote("bad", ["PROOF REJECTED", data.error || "unknown reason"]));
+    return;
+  }
+  target.replaceChildren(proofNote("ok", [
+    "PROOF VALID",
+    "chain " + data.chain_uid + ", event " + (data.leaf_index + 1) + " of " + data.tree_size,
+    data.path_len + " hashes checked against root " + data.signed_root.slice(0, 32) + "...",
+    "checkpoint " + data.key_source,
+    "This record was in the log when that checkpoint was signed.",
+  ]));
+}
+
+/* `raw` is the bundle's JSON text, posted verbatim. It must not be parsed and
+   re-serialized on the way: see the note where currentProofText is set. */
+async function checkProofPayload(raw, target) {
+  target.replaceChildren(proofNote("info", ["Checking..."]));
+  try {
+    const res = await authedFetch("/api/verify-proof", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: raw,
+    });
+    const data = await res.json().catch(() => ({}));
+    renderProofOutcome(target, data, res.ok);
+  } catch (e) {
+    target.replaceChildren(proofNote("bad", ["Could not reach the console: " + e.message]));
+  }
+}
+
+async function checkPastedProof() {
+  const target = $("proof-check-out");
+  const text = $("proof-input").value.trim();
+  if (!text) {
+    target.replaceChildren(proofNote("bad", ["Paste a proof bundle first."]));
+    return;
+  }
+  // Parsed only to check it is JSON and to find the bundle inside a wrapper.
+  // The text itself is what gets sent, never a re-serialized copy.
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    target.replaceChildren(proofNote("bad", ["That is not valid JSON: " + e.message]));
+    return;
+  }
+  if (!parsed.leaf_record && parsed.proof) {
+    target.replaceChildren(proofNote("bad", [
+      "That looks like a console response rather than a proof.",
+      "Paste the bundle itself - the part starting with \"chain_uid\".",
+    ]));
+    return;
+  }
+  if (!parsed.leaf_record || !parsed.checkpoint) {
+    target.replaceChildren(proofNote("bad", ["That is JSON, but not a proof bundle."]));
+    return;
+  }
+  await checkProofPayload(text, target);
+}
+
+$("btn-prove").addEventListener("click", generateProof);
+$("btn-copy-proof").addEventListener("click", copyProof);
+$("btn-check-proof").addEventListener("click", () => {
+  if (currentProofText) checkProofPayload(currentProofText, $("d-proof-out"));
+});
+$("btn-check-pasted").addEventListener("click", checkPastedProof);
+
+$("btn-ask").addEventListener("click", askAboutEvent);
+$("d-ask").addEventListener("keydown", (e) => { if (e.key === "Enter") askAboutEvent(); });
+$("btn-close-drawer").addEventListener("click", closeDrawer);
+$("backdrop").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+/* ---------------------------------------------------------------- packs */
+function renderPacks(list) {
+  const body = $("packs-body");
+  body.replaceChildren();
+  $("tally-packs").textContent = list.length;
+  $("packs-sub").textContent = list.length + " compiled and loaded";
+  if (!list.length) {
+    const tr = el("tr"); const td = el("td", "empty", "No packs loaded."); td.colSpan = 8;
+    tr.append(td); body.append(tr); return;
+  }
+  const claimed = window.__byPack || {};
+  list.forEach((p) => {
+    const tr = el("tr");
+    tr.append(el("td", "mono", p.id));
+    tr.append(el("td", null, p.vendor));
+    tr.append(el("td", null, p.product));
+    tr.append(el("td", "mono", (p.decoders || []).join(" › ")));
+    tr.append(el("td", "num", p.priority));
+    tr.append(el("td", "num", p.mapped_attributes));
+    const fx = el("td");
+    const pass = p.fixtures_passed === p.fixtures && p.fixtures > 0;
+    fx.append(pill(pass ? "ok" : "warn", p.fixtures_passed + "/" + p.fixtures));
+    tr.append(fx);
+    tr.append(el("td", "num", (claimed[p.id] || 0).toLocaleString()));
+    body.append(tr);
+  });
+}
+
+/* ------------------------------------------------------------- clusters */
+let openClusterSamples = null;
+
+function appendClusterSamples(body, cluster) {
+  const detail = el("tr");
+  const cell = el("td");
+  cell.colSpan = 5;
+  cell.style.background = "var(--sunken)";
+  cell.style.padding = "14px 16px";
+  const heading = el("div", null, "Representative events in " + cluster.id);
+  heading.style.fontWeight = "650";
+  heading.style.marginBottom = "8px";
+  cell.append(heading);
+  const note = el("div", "sub",
+    "Showing " + (cluster.samples || []).length.toLocaleString() +
+    " retained examples from " + cluster.count.toLocaleString() +
+    " matching events. These are individual raw records, not generated summaries.");
+  note.style.marginBottom = "10px";
+  cell.append(note);
+  const records = el("div", "codebox");
+  records.style.maxHeight = "320px";
+  records.style.overflow = "auto";
+  (cluster.samples || []).forEach((sample, index) => {
+    const line = el("div", "mono", (index + 1) + ". " + sample);
+    line.style.padding = "5px 0";
+    line.style.borderBottom = "1px solid var(--border)";
+    records.append(line);
+  });
+  cell.append(records);
+  detail.append(cell);
+  body.append(detail);
+}
+
+function renderClusters(list, overflow) {
+  const body = $("clusters-body");
+  body.replaceChildren();
+  $("tally-clusters").textContent = list.length;
+  $("cl-overflow").textContent = overflow
+    ? overflow.toLocaleString() + " further lines exceeded the template cap"
+    : "";
+  if (!list.length) {
+    const tr = el("tr");
+    const td = el("td", "empty", "No unparsed records. Every event so far was claimed by a pack.");
+    td.colSpan = 5;
+    tr.append(td); body.append(tr); return;
+  }
+  // Rank by share of unparsed traffic, not just raw count: "write this pack and
+  // 38% of what you cannot read becomes readable" is the decision an operator
+  // is actually making.
+  const totalUnparsed = list.reduce((sum, c) => sum + c.count, 0) + (overflow || 0);
+  list.forEach((c) => {
+    const tr = el("tr");
+    tr.append(el("td", "mono", c.id));
+    const share = totalUnparsed ? (100 * c.count) / totalUnparsed : 0;
+    const countCell = el("td", "num", c.count.toLocaleString());
+    const pct = el("div", "sub", share >= 0.1 ? share.toFixed(1) + "% of unparsed" : "");
+    countCell.append(pct);
+    tr.append(countCell);
+    const t = el("td", "mono", c.template.length > 110 ? c.template.slice(0, 110) + "…" : c.template);
+    t.title = c.template;
+    if (typeof c.specificity === "number") {
+      const specPct = Math.round(c.specificity * 100);
+      // Below half the template positions are still literal: a loose match
+      // like this merged more variety than an operator should trust at a
+      // glance, whatever the count says.
+      const specPill = pill(c.specificity < 0.5 ? "warn" : "neutral", specPct + "% literal");
+      specPill.title = "Share of the template that is still a fixed token rather than a <*> wildcard.";
+      const specWrap = el("div"); specWrap.style.marginTop = "4px";
+      specWrap.append(specPill);
+      t.append(specWrap);
+    }
+    tr.append(t);
+    const profile = c.source_profile || {};
+    const source = el("td");
+    const family = el("div", null, profile.source_family || "unknown");
+    family.style.fontWeight = "650";
+    source.append(family);
+    const confidence = typeof profile.source_family_confidence === "number"
+      ? Math.round(profile.source_family_confidence * 100) + "% family confidence"
+      : "no family confidence";
+    source.append(el("div", "sub", (profile.wire_format || "unknown format") + " · " + confidence));
+    const hypothesis = (profile.source_hypotheses || [])[0];
+    if (hypothesis) {
+      const name = [hypothesis.vendor, hypothesis.product].filter(Boolean).join(" ");
+      source.append(el("div", "sub", "Possible: " + name + " (" + Math.round(hypothesis.confidence * 100) + "%)"));
+    } else {
+      source.append(el("div", "sub", "Vendor/product not identifiable from these samples"));
+    }
+    source.title = (profile.evidence || []).concat(profile.warnings || []).join("\n");
+    tr.append(source);
+    const actions = el("td");
+    const ai = el("button", "btn sm", "AI Copilot");
+    const heur = el("button", "btn sm", "Heuristic");
+    const samples = el("button", "btn sm", openClusterSamples === c.id ? "Hide samples" : "Samples");
+    ai.addEventListener("click", () => generatePack(c.id, "ai", [ai, heur]));
+    heur.addEventListener("click", () => generatePack(c.id, "heuristic", [ai, heur]));
+    samples.addEventListener("click", () => {
+      openClusterSamples = openClusterSamples === c.id ? null : c.id;
+      renderClusters(list, overflow);
+    });
+    const wrap = el("div"); wrap.style.display = "flex"; wrap.style.gap = "6px"; wrap.style.flexWrap = "wrap";
+    wrap.append(samples, ai, heur);
+    actions.append(wrap);
+    tr.append(actions);
+    body.append(tr);
+    if (openClusterSamples === c.id) appendClusterSamples(body, c);
+  });
+}
+
+let draftYaml = null;
+/* The generator's untouched output, so "Revert" restores the draft rather than
+   the last thing that happened to validate. */
+let generatedYaml = null;
+let packEdited = false;
+/* Set only by the explicit Replace action, and cleared after every approve. */
+let replaceExisting = false;
+
+/* Render a validation outcome under the editor. Parse and compile failures are
+   ordinary states halfway through an edit, so they are shown here rather than
+   thrown -- the operator needs the message next to the YAML that caused it. */
+function showValidation(result) {
+  const box = $("rev-validation");
+  box.className = "callout " + (result.ok ? "ok" : "bad");
+  box.replaceChildren();
+  box.append(el("div", null, result.detail || (result.ok ? "Valid." : "Not valid.")));
+
+  (result.failures || []).forEach((f) => {
+    const line = el("div", "mono", f);
+    line.style.fontSize = "12px";
+    line.style.marginTop = "4px";
+    box.append(line);
+  });
+
+  const unknown = result.unknown_ocsf_paths || [];
+  if (unknown.length) {
+    const note = el("div", null,
+      unknown.length + " attribute path" + (unknown.length > 1 ? "s are" : " is")
+      + " not in the vendored OCSF 1.9.0 schema: " + unknown.join(", ")
+      + ". These are written to `unmapped` rather than rejected.");
+    note.style.marginTop = "6px";
+    box.append(note);
+  }
+  box.hidden = false;
+}
+
+async function revalidatePack() {
+  const yaml = $("rev-yaml").value.trim();
+  if (!yaml) return;
+  const btn = $("btn-revalidate");
+  btn.disabled = true;
+  showValidation({ ok: true, detail: "Validating…" });
+  try {
+    const result = await postJson("/api/validate-pack", { yaml: yaml });
+    showValidation(result);
+    if (result.fixtures != null) {
+      $("rev-fixtures").textContent = result.fixtures_passed + "/" + result.fixtures + " fixtures";
+      $("rev-accuracy").textContent = Math.round((result.field_accuracy || 0) * 100) + "% fields";
+    }
+    // Validation happened, so the "not yet revalidated" warning is stale
+    // whatever the answer was.
+    $("rev-edited").hidden = true;
+  } catch (e) {
+    showValidation({ ok: false, detail: e.message });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("btn-revalidate").addEventListener("click", revalidatePack);
+
+$("btn-revert").addEventListener("click", () => {
+  if (generatedYaml == null) return;
+  $("rev-yaml").value = generatedYaml;
+  packEdited = false;
+  $("rev-edited").hidden = true;
+  $("rev-validation").hidden = true;
+});
+
+/* Editing invalidates the score in the header: those pills describe the draft
+   that was generated, not the text now on screen. Flag it rather than silently
+   letting a stale "2/2 fixtures" sit above modified YAML. */
+$("rev-yaml").addEventListener("input", () => {
+  packEdited = $("rev-yaml").value !== generatedYaml;
+  $("rev-edited").hidden = !packEdited;
+});
+
+/* Tab should indent inside the editor, not move focus out of it. Escape first
+   restores tab-out, so the editor never becomes a keyboard trap. */
+let packEditorTabTraps = true;
+$("rev-yaml").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { packEditorTabTraps = false; return; }
+  if (e.key !== "Tab" || !packEditorTabTraps) return;
+  e.preventDefault();
+  const box = e.target;
+  const at = box.selectionStart;
+  box.value = box.value.slice(0, at) + "  " + box.value.slice(box.selectionEnd);
+  box.selectionStart = box.selectionEnd = at + 2;
+  packEdited = box.value !== generatedYaml;
+  $("rev-edited").hidden = !packEdited;
+});
+$("rev-yaml").addEventListener("focus", () => { packEditorTabTraps = true; });
+async function generatePack(clusterId, mode, buttons) {
+  buttons.forEach((b) => { b.disabled = true; });
+  const pane = $("review-pane");
+  pane.hidden = false;
+  $("review-sub").textContent = mode === "heuristic"
+    ? "Running the deterministic generator…"
+    : "Asking the local model…";
+  $("rev-yaml").value = "";
+  $("rev-profile").hidden = true;
+  $("btn-approve").hidden = true;
+  $("btn-revalidate").hidden = true;
+  $("btn-revert").hidden = true;
+  $("rev-edited").hidden = true;
+  $("rev-validation").hidden = true;
+  $("btn-replace").hidden = true;
+  replaceExisting = false;
+  draftYaml = null;
+  generatedYaml = null;
+
+  try {
+    const data = await postJson("/api/generate", { cluster_id: clusterId, mode: mode });
+    draftYaml = data.pack_yaml;
+    const via = data.generator === "heuristic"
+      ? "deterministic heuristic generator"
+      : "model " + (data.model || "unknown");
+    const fellBack = data.reason === "llm-offline"
+      ? " The model was unreachable, so the deterministic generator ran instead."
+      : "";
+    $("review-sub").textContent = "Drafted by the " + via + "." + fellBack;
+    $("rev-fixtures").textContent = data.fixtures_passed + "/" + data.fixtures + " fixtures";
+    $("rev-accuracy").textContent = Math.round((data.field_accuracy || 0) * 100) + "% fields";
+    const unknownPaths = data.unknown_ocsf_paths || [];
+    const profile = data.source_profile || {};
+    const profileEl = $("rev-profile");
+    const top = (profile.source_hypotheses || [])[0];
+    const sourceName = top
+      ? [top.vendor, top.product].filter(Boolean).join(" ") + " (" + Math.round(top.confidence * 100) + "% hypothesis)"
+      : "vendor/product unknown";
+    const familyConfidence = Math.round((profile.source_family_confidence || 0) * 100);
+    const formatConfidence = Math.round((profile.wire_format_confidence || 0) * 100);
+    const evidence = (profile.evidence || []).join(" ");
+    const warnings = (profile.warnings || []).join(" ");
+    profileEl.textContent = "Assessment: " + (profile.wire_format || "unknown format")
+      + " (" + formatConfidence + "%), " + (profile.source_family || "unknown family")
+      + " (" + familyConfidence + "%), " + sourceName + ". " + evidence
+      + (warnings ? " Review warning: " + warnings : "");
+    profileEl.hidden = false;
+    const warnEl = $("rev-ocsf-warning");
+    if (unknownPaths.length > 0) {
+      warnEl.hidden = false;
+      warnEl.textContent = unknownPaths.length + " unrecognized OCSF path" + (unknownPaths.length > 1 ? "s" : "") + ": " + unknownPaths.join(", ");
+    } else {
+      warnEl.hidden = true;
+    }
+    $("rev-yaml").value = data.pack_yaml;
+    // Keep the untouched draft so "Revert" means the generator's output, not
+    // whatever the last validation happened to accept.
+    generatedYaml = data.pack_yaml;
+    packEdited = false;
+    $("btn-approve").hidden = false;
+    $("btn-revalidate").hidden = false;
+    $("btn-revert").hidden = false;
+    // Score the draft immediately. A draft the generator could not give a
+    // detector cannot be approved at all, and finding that out by clicking
+    // "Approve and deploy" and reading a compile error is a bad way to learn
+    // it. Validating on arrival puts the blocking reason under the editor,
+    // next to the YAML the operator has to fix.
+    revalidatePack();
+  } catch (e) {
+    $("review-sub").textContent = "Could not draft a pack.";
+    $("rev-yaml").value = e.message;
+  } finally {
+    buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+
+$("btn-approve").addEventListener("click", async () => {
+  // Whatever is in the editor is what gets deployed, edited or not. The server
+  // re-parses, re-compiles and re-scores it before writing regardless, so the
+  // editor cannot talk it into activating something broken.
+  const yaml = $("rev-yaml").value.trim();
+  if (!yaml) return;
+  const btn = $("btn-approve");
+  btn.disabled = true;
+  try {
+    const out = await postJson("/api/approve", { yaml: yaml, replace: replaceExisting });
+    $("review-sub").textContent = (packEdited ? "Operator-edited pack approved" : "Approved")
+      + " and written to " + out.file + ". The pack watcher will load it.";
+    btn.hidden = true;
+    $("btn-revalidate").hidden = true;
+    $("btn-revert").hidden = true;
+    $("rev-edited").hidden = true;
+    showValidation({ ok: true, detail: out.fixtures_passed + "/" + out.fixtures + " fixtures passed. Pack is live." });
+    refresh();
+  } catch (e) {
+    // A name collision is a decision, not a failure. Approving over an
+    // existing pack replaces a parser that may be live and working, so the
+    // operator is asked rather than told - and renaming is offered first,
+    // because two different devices wanting one filename is the more common
+    // cause than genuinely wanting to supersede a pack.
+    if (/already exists/.test(e.message)) {
+      $("review-sub").textContent = "Not approved: that pack name is taken.";
+      showValidation({
+        ok: false,
+        detail: e.message + " Edit identity.id above and approve again, or replace the existing pack.",
+      });
+      $("btn-replace").hidden = false;
+    } else {
+      $("review-sub").textContent = "Not approved: " + e.message;
+    }
+  } finally {
+    btn.disabled = false;
+    replaceExisting = false;
+  }
+});
+
+/* Explicit second action rather than a confirm(): the operator has to choose
+   the destructive path on purpose, and can still rename instead. */
+$("btn-replace").addEventListener("click", () => {
+  replaceExisting = true;
+  $("btn-replace").hidden = true;
+  $("btn-approve").click();
+});
+
+/* ------------------------------------------------------------- integrity */
+$("btn-verify").addEventListener("click", async () => {
+  const out = $("verify-out");
+  out.replaceChildren(el("div", "callout info", "Verification running…"));
+  try {
+    const r = await postJson("/api/verify");
+    const box = el("div", "callout " + (r.ok ? "ok" : "bad"));
+    const lines = [];
+    if (r.ok) {
+      lines.push("Chain verified.");
+      lines.push(Number(r.count).toLocaleString() + " events re-hashed, every link intact.");
+      lines.push("Checkpoint signature: " + (r.checkpoint_signature_valid ? "valid (Ed25519)" : "INVALID"));
+      lines.push("Signed anchor: " + (r.checkpoint_at_head
+        ? "at the current head"
+        : "trails the head, as expected between periodic checkpoints"));
+      if (r.head_fingerprint) lines.push("Head fingerprint: " + r.head_fingerprint);
+    } else {
+      lines.push("Chain verification FAILED.");
+      if (typeof r.count === "number") lines.push(Number(r.count).toLocaleString() + " events examined.");
+      lines.push(r.detail || "no detail returned");
+    }
+    const strong = el("b", null, lines[0]);
+    box.append(strong);
+    lines.slice(1).forEach((t) => { box.append(el("div", null, t)); });
+    out.replaceChildren(box);
+  } catch (e) {
+    out.replaceChildren(el("div", "callout bad", "Could not reach the console: " + e.message));
+  }
+});
+
+/*
+ * The tamper control used to POST with no body at all. The endpoint requires
+ * {index, path, value}, so it answered 415, the result was never checked, and
+ * the console announced success while the chain was in fact untouched — the
+ * demo reported the opposite of the property it exists to show.
+ */
+$("btn-tamper").addEventListener("click", async () => {
+  const out = $("tamper-out");
+  const index = Number.parseInt($("tamper-index").value, 10);
+  const path = $("tamper-path").value.trim();
+  const value = $("tamper-value").value;
+
+  if (!Number.isInteger(index) || index < 0) {
+    out.replaceChildren(el("div", "callout bad", "Event row must be a number, 0 or greater."));
+    return;
+  }
+  if (!path) {
+    out.replaceChildren(el("div", "callout bad", "Name the attribute to alter, for example src_endpoint.ip."));
+    return;
+  }
+  if (!latestEvents.length) {
+    out.replaceChildren(el("div", "callout warn", "No events retained yet. Send some traffic first."));
+    return;
+  }
+
+  const btn = $("btn-tamper");
+  btn.disabled = true;
+  try {
+    const r = await postJson("/api/tamper", { index: index, path: path, value: value });
+    const box = el("div", "callout warn");
+    box.append(el("b", null, "Retained event altered."));
+    box.append(el("div", null, "Event " + (r.uid || "") ));
+    box.append(el("div", null, path + ": " + JSON.stringify(r.before) + " → " + JSON.stringify(r.after)));
+    box.append(el("div", null, "Run verification now — it should report a fingerprint mismatch."));
+    out.replaceChildren(box);
+  } catch (e) {
+    out.replaceChildren(el("div", "callout bad", "Could not alter the event: " + e.message));
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("btn-clear").addEventListener("click", async () => {
+  try { await postJson("/api/clear"); await refresh(); }
+  catch (e) { console.error(e); }
+});
+
+/* ---------------------------------------------------------------- ingest */
+$("btn-ingest").addEventListener("click", async () => {
+  const text = $("ingest-text").value;
+  const status = $("ingest-status");
+  if (!text.trim()) {
+    status.hidden = false;
+    status.className = "pill warn";
+    status.textContent = "Nothing to normalize";
+    return;
+  }
+  const btn = $("btn-ingest");
+  btn.disabled = true;
+  status.hidden = false;
+  status.className = "pill neutral";
+  status.textContent = "Running…";
+  try {
+    const r = await postJson("/api/ingest", { lines: text });
+    const results = r.results || [];
+    const parsed = results.filter((x) => x.disposition === "parsed").length;
+    status.className = "pill " + (parsed === results.length ? "ok" : "warn");
+    status.textContent = parsed + "/" + results.length + " normalized";
+    $("ingest-result").textContent = JSON.stringify(results, null, 2);
+    await refresh();
+  } catch (e) {
+    status.className = "pill bad";
+    status.textContent = "Failed";
+    $("ingest-result").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ------------------------------------------------------------------ chat */
+const chatThread = [];
+async function sendChat() {
+  const input = $("chat-input");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  const history = $("chat-history");
+  history.append(el("div", "msg user", text));
+  history.scrollTop = history.scrollHeight;
+  chatThread.push({ role: "user", content: text });
+
+  const thinking = el("div", "msg bot", "Thinking…");
+  history.append(thinking);
+  history.scrollTop = history.scrollHeight;
+
+  const btn = $("btn-chat");
+  btn.disabled = true;
+  try {
+    const r = await postJson("/api/chat", { messages: chatThread });
+    thinking.textContent = r.reply;
+    chatThread.push({ role: "assistant", content: r.reply });
+    if (r.model) $("chat-model").textContent = r.model;
+  } catch (e) {
+    thinking.className = "msg err";
+    thinking.textContent = "The local model is unavailable: " + e.message
+      + "\nThe deterministic generator on the Needs a pack view does not require it.";
+  } finally {
+    btn.disabled = false;
+    history.scrollTop = history.scrollHeight;
+  }
+}
+$("btn-chat").addEventListener("click", sendChat);
+$("chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+
+/* ------------------------------------------------ source pulse analytics */
+const ANALYTICS={stats:null,packs:[],samples:[],packRates:new Map(),previousReceived:null,previousPacks:{},sampledAt:null};
+/* Chart colours live in CSS, not here, so light and dark are declared in one
+   place and a legend can never disagree with the shape it labels. These are
+   re-read on every theme change rather than captured once at load. */
+function cssVar(name, fallback){
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+function chartPalette(){
+  return [1,2,3,4,5,6,7,8].map(i => cssVar("--chart-" + i, "#3568B8"));
+}
+let ANALYTICS_COLOURS = chartPalette();
+let CHART_GRID = cssVar("--grid", "#E5E9F1");
+function analyticsSourceName(id){
+  const pack=ANALYTICS.packs.find(p=>p.id===id);if(!pack)return id;
+  const parts=[pack.vendor,pack.product].filter(x=>x&&x!=="Unknown");
+  return(parts.join(" ")||id).replace(/^(\S+)\s+\1\b/i,"$1");
+}
+function analyticsUpdate(stats,packs){
+  const now=Date.now(),received=Number(stats.received||0),dt=ANALYTICS.sampledAt?(now-ANALYTICS.sampledAt)/1000:0;
+  if(ANALYTICS.previousReceived!==null&&received<ANALYTICS.previousReceived){ANALYTICS.samples=[];ANALYTICS.packRates.clear();ANALYTICS.previousPacks={};}
+  ANALYTICS.stats=stats;ANALYTICS.packs=packs||[];
+  if(!ANALYTICS.sampledAt||dt>=.5){
+    const eps=dt&&ANALYTICS.previousReceived!==null?Math.max(0,(received-ANALYTICS.previousReceived)/dt):0;
+    ANALYTICS.samples.push({t:now,eps,received});
+    if(ANALYTICS.samples.length>90)ANALYTICS.samples.shift();
+    const current=stats.by_pack||{},ids=new Set([...Object.keys(current),...Object.keys(ANALYTICS.previousPacks)]);
+    ids.forEach(id=>{const list=ANALYTICS.packRates.get(id)||[],rate=dt?Math.max(0,(Number(current[id]||0)-Number(ANALYTICS.previousPacks[id]||0))/dt):0;list.push(rate);if(list.length>60)list.shift();ANALYTICS.packRates.set(id,list);});
+    ANALYTICS.previousPacks={...current};ANALYTICS.previousReceived=received;ANALYTICS.sampledAt=now;
+  }
+  if($("view-analytics").classList.contains("active"))analyticsDraw();
+}
+function analyticsDraw(){
+  const s=ANALYTICS.stats;if(!s)return;
+  const latest=ANALYTICS.samples.at(-1)||{eps:0},peak=Math.max(0,...ANALYTICS.samples.map(x=>x.eps)),active=Object.values(s.by_pack||{}).filter(Number).length;
+  $("ak-received").textContent=Number(s.received||0).toLocaleString();$("ak-sources").textContent=active+" active source"+(active===1?"":"s");
+  $("ak-coverage").textContent=(Number(s.coverage||0)*100).toFixed(4)+"%";$("ak-parsed").textContent=Number(s.parsed||0).toLocaleString()+" records mapped";
+  $("ak-rate").textContent=Math.round(latest.eps).toLocaleString()+" EPS";$("ak-peak").textContent="peak "+Math.round(peak).toLocaleString()+" EPS";$("ak-unknown").textContent=Number(s.unidentified||0).toLocaleString();
+  const seconds=ANALYTICS.samples.length>1?Math.round((ANALYTICS.samples.at(-1).t-ANALYTICS.samples[0].t)/1000):0;
+  $("analytics-window").className="pill "+(seconds?"ok":"neutral");$("analytics-window").replaceChildren(el("i"),document.createTextNode(seconds?seconds+"s live window":"collecting"));
+  drawSourcePulses();
+}
+function pulsePath(values,w,h){
+  const max=Math.max(1,...values),min=Math.min(0,...values),span=Math.max(1,max-min);
+  return values.map((v,i)=>(i?"L":"M")+(18+(values.length===1?0:(w-36)*i/(values.length-1)))+","+(h-20-(v-min)/span*(h-42))).join(" ");
+}
+
+function drawSourcePulses(){
+  const host=$("source-pulses"),s=ANALYTICS.stats,query=$("pulse-search").value.trim().toLowerCase(),sort=$("pulse-sort").value,parsed=Math.max(1,Number(s.parsed||0));
+  let rows=Object.entries(s.by_pack||{}).filter(x=>Number(x[1])>0).map(([id,total])=>{const values=ANALYTICS.packRates.get(id)||[0];return{id,total:Number(total),values,rate:Number(values.at(-1)||0),name:analyticsSourceName(id)}});
+  if(query)rows=rows.filter(x=>(x.name+" "+x.id).toLowerCase().includes(query));
+  rows.sort(sort==="rate"?(a,b)=>b.rate-a.rate:sort==="name"?(a,b)=>a.name.localeCompare(b.name):(a,b)=>b.total-a.total);
+  const combined=rows.reduce((n,x)=>n+x.rate,0);$("pulse-active").textContent=rows.length;$("pulse-combined").textContent=Math.round(combined).toLocaleString();$("pulse-samples").textContent=ANALYTICS.samples.length;
+  host.replaceChildren();
+  if(!rows.length){const empty=el("div","pulse-empty");empty.append(el("b",null,query?"No matching Source Pack":"No source traffic yet"),el("span",null,query?"Change or clear the filter.":"Start the traffic simulator or connect a log source."));host.append(empty);return;}
+  rows.forEach((row,index)=>{
+    const colour=ANALYTICS_COLOURS[index%ANALYTICS_COLOURS.length],peak=Math.max(0,...row.values),average=row.values.length?row.values.reduce((a,b)=>a+b,0)/row.values.length:0;
+    const card=el("article","source-pulse"),head=el("div","source-pulse-head"),name=el("div","source-pulse-name",row.name);name.append(el("small",null,row.id));
+    const total=el("div","source-pulse-total",row.total.toLocaleString());total.append(el("small",null,"records claimed"));head.append(name,total);card.append(head);
+    const metrics=el("div","source-pulse-metrics");
+    [["Current",Math.round(row.rate).toLocaleString()+" EPS"],["Peak",Math.round(peak).toLocaleString()+" EPS"],["Traffic share",(row.total/parsed*100).toFixed(1)+"%"]].forEach(([label,value])=>{const box=el("div");box.append(el("b",null,value),el("span",null,label));metrics.append(box)});card.append(metrics);
+    const w=560,h=145,d=pulsePath(row.values,w,h),svg=svgEl("svg",{viewBox:"0 0 "+w+" "+h,role:"img","aria-label":"Recent event rate for "+row.name});
+    [0,.5,1].forEach(q=>svg.append(svgEl("line",{x1:18,y1:18+(h-42)*q,x2:w-18,y2:18+(h-42)*q,stroke:CHART_GRID,"stroke-width":1,"stroke-dasharray":"3 6"})));
+    const area=d+" L"+(w-18)+","+(h-20)+" L18,"+(h-20)+" Z";svg.append(svgEl("path",{d:area,fill:colour,"fill-opacity":.09}),svgEl("path",{d,fill:"none",stroke:colour,"stroke-width":2.5,"stroke-linejoin":"round","stroke-linecap":"round"}));
+    if(row.values.length){const lastX=row.values.length===1?18:w-18,lastY=h-20-(row.rate-Math.min(0,...row.values))/Math.max(1,Math.max(1,...row.values)-Math.min(0,...row.values))*(h-42);svg.append(svgEl("circle",{cx:lastX,cy:lastY,r:4,fill:colour,stroke:"#fff","stroke-width":2}));}
+    card.append(svg);const foot=el("div","source-pulse-foot");foot.append(el("span",null,row.values.length+" measurements"),el("span",null,"average "+Math.round(average).toLocaleString()+" EPS"));card.append(foot);host.append(card);
+  });
+}
+$("pulse-search").addEventListener("input",drawSourcePulses);$("pulse-sort").addEventListener("change",drawSourcePulses);
+window.analyticsDraw=analyticsDraw;
+
+/* --------------------------------------------------------------- polling */
+let lastReceived = 0;
+let lastAt = Date.now();
+
+/* ------------------------------------------------------------ theme
+   Three states, not two: an explicit choice is stamped on <html> and wins in
+   both directions, and no stamp at all means "follow the OS", which is what
+   most people are on. The stamp is applied before first paint by the inline
+   script in <head>, so the console never flashes light before going dark.
+
+   Everything visual reads its colour from a CSS token, with one exception:
+   the SVG charts are drawn by script and were handed literal hex. Those now
+   read the same tokens through getComputedStyle, so a theme change has to
+   re-read them and redraw -- otherwise the panels change and the charts do
+   not. */
+/* One theme, deliberately. The console is read in an operations room and on a
+   projector, and a palette that changes with the viewer's OS is a palette
+   nobody tuned. The SVG charts read their colours from the same CSS tokens as
+   everything else, so there is one place a colour is defined and one place it
+   is changed. */
+
+/* ------------------------------------------------------------ theme
+   Three states, not two: an explicit choice is stamped on <html> and wins in
+   both directions, and no stamp at all means "follow the OS", which is what
+   most viewers are on. The stamp is applied before first paint by the inline
+   script in <head>, so the console never flashes light before going dark.
+
+   Everything visual reads its colour from a CSS token, with one exception:
+   the SVG charts are drawn by script and read those tokens through
+   getComputedStyle at draw time. A theme change therefore has to re-read them
+   and redraw, or the panels would change and the charts would not. */
+function themeCurrent() {
+  const stamped = document.documentElement.getAttribute("data-theme");
+  if (stamped) return stamped;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function themeSyncButton() {
+  const btn = document.getElementById("themebtn");
+  if (!btn) return;
+  const dark = themeCurrent() === "dark";
+  btn.setAttribute("aria-pressed", dark ? "true" : "false");
+  const label = document.getElementById("themebtn-label");
+  if (label) label.textContent = dark ? "Light theme" : "Dark theme";
+}
+
+function themeRepaint() {
+  ANALYTICS_COLOURS = chartPalette();
+  FLOW_HUES = chartPalette();
+  CHART_GRID = cssVar("--grid", "#E5E9F1");
+  themeSyncButton();
+  // Every script-drawn surface, so none of them keeps the other theme's
+  // colours. Wrapped because a view that is not mounted has nothing to size,
+  // and a failed redraw must not take the poll loop down with it.
+  try { if (typeof flowDraw === "function") flowDraw(); } catch (e) {}
+  try { if (typeof trendDraw === "function") trendDraw(); } catch (e) {}
+}
+
+function themeApply(next) {
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("ulpf-theme", next); } catch (e) {}
+  themeRepaint();
+}
+
+(function themeBind() {
+  const btn = document.getElementById("themebtn");
+  if (btn) {
+    btn.addEventListener("click", () =>
+      themeApply(themeCurrent() === "dark" ? "light" : "dark"));
+  }
+  // With no explicit stamp the OS is in charge, so follow it as it changes.
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (!document.documentElement.getAttribute("data-theme")) themeRepaint();
+  });
+  themeSyncButton();
+})();
+
+async function refresh() {
+  try {
+    const [stats, events, packs, clusters] = await Promise.all([
+      api("/api/stats"), api("/api/events"), api("/api/packs"), api("/api/clusters"),
+    ]);
+
+    window.__byPack = stats.by_pack || {};
+    $("schema-ver").textContent = stats.schema_version || "1.9.0";
+    lastTotalReceived = Number(stats.received) || 0;
+    $("st-recv").textContent = lastTotalReceived.toLocaleString();
+    $("st-parsed").textContent = Number(stats.parsed).toLocaleString();
+    $("st-cov").textContent = ((stats.coverage || 0) * 100).toFixed(4) + "% coverage";
+    $("st-unid").textContent = Number(stats.unidentified).toLocaleString();
+    $("st-bytes").textContent = fmtBytes(stats.bytes_in);
+    // The attestation chain outlives the process. `serve` signs a checkpoint
+    // over the leaves already on disk before it binds a socket, so this reads
+    // in the millions beside "Events received: 0" on a fresh start -- four
+    // session counters and one lifetime counter in the same row, which reads
+    // as a fabricated number rather than the true length of the chain.
+    // Show what this session added, and account for the rest underneath.
+    const seqStart = Number(stats.chain_sequence_at_start) || 0;
+    const seqNow = Number(stats.chain_sequence) || 0;
+    const seqAdded = Math.max(0, seqNow - seqStart);
+    $("st-seq").textContent = seqAdded.toLocaleString();
+
+    const failed = (stats.extract_failed || 0) + (stats.normalize_failed || 0);
+    $("st-unid-note").textContent = failed
+      ? failed.toLocaleString() + " also failed extraction or mapping"
+      : (stats.unidentified ? "no pack detector matched" : "no unparsed records");
+
+    const now = Date.now();
+    const dt = (now - lastAt) / 1000;
+    if (dt > 0.5 && stats.received > lastReceived) {
+      $("st-rate").textContent = Math.round((stats.received - lastReceived) / dt).toLocaleString() + " logs arriving every second";
+    } else if (stats.received === 0) {
+      $("st-rate").textContent = "awaiting traffic";
+    }
+    if (dt > 0.5) { lastReceived = stats.received; lastAt = now; }
+    for (const id of ["map-rate", "globe-rate", "trend-rate"]) {
+      const pill = $(id);
+      if (!pill) continue;
+      pill.className = "pill " + (stats.received > 0 ? "ok" : "neutral");
+      pill.replaceChildren(el("i"), document.createTextNode(
+        stats.received > 0 ? $("st-rate").textContent : "idle"));
+    }
+
+    const chain = $("chain-pill");
+    chain.className = "pill " + (stats.checkpoint_signed ? "ok" : "neutral");
+    chain.replaceChildren(el("i"), document.createTextNode(
+      stats.checkpoint_signed
+        ? "chain signed · " + seqNow.toLocaleString() + " sealed"
+        : "chain idle"));
+    $("st-chain").textContent = !stats.checkpoint_signed
+      ? "no checkpoint yet"
+      : seqStart
+        ? "this session · " + seqStart.toLocaleString() + " already in the chain"
+        : "this session · chain starts here";
+
+    renderEvents(events.events || []);
+    // Vault retrieval is real file I/O; only pay for it while the operator is
+    // actually looking at the evidence view.
+    if (rawViewActive() && $("raw-follow").checked) refreshRawFeed();
+    // The badge shows everything received, not the length of the live tail.
+    // The tail is capped at RECENT_CAPACITY (500) server-side, so reading its
+    // length pinned this badge at "500" forever the moment the 500th record
+    // arrived -- next to "Needs a pack 1" and "Source Packs 35", which are
+    // real counts, it read as one too.
+    $("tally-events").textContent = compactCount(Number(stats.received || 0));
+    renderPacks(packs.packs || []);
+    renderClusters(clusters.clusters || [], clusters.overflow || 0);
+    analyticsUpdate(stats, packs.packs || []);
+    // Rendering runs outside the fetch guard below. A thrown error in here is
+    // a bug in this file, and reporting it as "Engine unreachable" points an
+    // operator at the network for a fault that is nowhere near it.
+    try {
+      flowUpdate(stats, events.events || [], packs.packs || [], clusters.clusters || []);
+      trendUpdate(stats);
+      if (document.querySelector("#view-livemap.active")) rosUpdate(events.events || [], false);
+    } catch (renderError) {
+      console.error("live map render failed", renderError);
+    }
+
+    const engine = $("engine-pill");
+    engine.className = "pill ok";
+    engine.replaceChildren(el("i"), document.createTextNode("Engine online"));
+  } catch (e) {
+    const engine = $("engine-pill");
+    engine.className = "pill bad";
+    engine.replaceChildren(el("i"), document.createTextNode("Engine unreachable"));
+  }
+}
+
+
+/* ------------------------------------------------------------- live map */
+/* The primary view is a flow diagram: every kind of device on the left, the
+   few shared meanings they all become on the right, and a band whose width is
+   how many records took that path. The companion Graph mode uses the same
+   model for exploration. Keeping both avoids forcing one visual grammar to do
+   two jobs: Flow proves the proportions; Graph reveals the system topology.
+
+   The flow layout is computed rather than simulated, so it cannot tangle:
+   columns are fixed, rows are stacked, and nothing overlaps at any number of
+   sources. It reads without instructions: many pipes going in, few coming
+   out, is the project's entire claim in one picture.
+
+   SVG rather than canvas because the text has to stay crisp on a projector at
+   any size, hit-testing comes free, and fullscreen is then just a viewBox.
+   No library: this file is include_str!'d into the binary and requirement (j)
+   rules out a CDN, and a two-column flow needs no general solver -- the whole
+   layout is the two stacking passes in flowLayout below. */
+
+const PENDING = "pending";
+
+const FLOW = {
+  rows: [],          // left column: one per pack, plus the unrecognised band
+  cols: [],          // right column: one per shared meaning, plus "not understood"
+  links: [],
+  shares: new Map(), // pack id -> { class_uid: share of that pack's records }
+  hover: null,
+  total: 0,
+  sampleSize: 0,
+};
+
+/* One colour per shared meaning.
+   Mid-saturation and close in lightness, because these are drawn as large
+   translucent bands: full-strength hues at that size fight each other and one
+   light value would make some bands vanish on a projector.
+   Assigned by position in the class ids sorted, not by hashing the id. A hash
+   is stable but says nothing about neighbours, and it put two meanings on
+   near-identical pinks the first time -- adjacent entries have to be
+   distinguishable, which only an ordered walk through the palette guarantees.
+   Sorting by id keeps a meaning's colour fixed as volumes change and the
+   columns reorder; a swatch that moved between refreshes would be worse than
+   no colour at all. */
+let FLOW_HUES = chartPalette();
+
+/* What each shared meaning actually means, in words a visitor has heard.
+   "Detection Finding" and "Event Log Activity" are OCSF class names: exact,
+   standard, and meaningless to anyone outside a security team. The payoff of
+   the whole project is written on this screen, and it was written in
+   vocabulary only a SOC analyst reads. The plain line is what the picture
+   shows; the OCSF name sits under it in small grey text, so a technical judge
+   still sees that we map to a real standard. */
+const PLAIN_MEANING = {
+  // Class 0 is what a record carries when no pack identified it: preserved,
+  // timestamped and searchable, but its kind is genuinely unknown. Saying so
+  // is the honest label -- anything more specific would be a claim.
+  0: "Kept and searchable, kind unknown",
+  1008: "A system event was logged",
+  2001: "A security finding was reported",
+  2004: "A security tool raised an alert",
+  3002: "A login was attempted",
+  4001: "Two machines talked",
+  4002: "A web request was made",
+  4009: "An email was handled",
+  6003: "An app made a request",
+};
+function plainMeaning(classUid) {
+  return PLAIN_MEANING[classUid] || null;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const FLOW_PAD = { top: 16, bottom: 14, left: 20, right: 20 };
+const FLOW_BAR = 11;          // width of a column's solid bar
+const FLOW_LABEL = 190;       // minimum room reserved for a label beside its bar
+
+/* How much room a column's labels get, for a panel of this width.
+   A fixed 190 was the whole gutter at any size, so going full screen widened
+   the bands and left the text truncated exactly as before -- the one place a
+   reader has room to spare was the one place it made no difference. A share of
+   the width, floored at the old value and capped so the bands never become a
+   thin ribbon between two walls of text. */
+function labelReserve(width) {
+  return Math.max(FLOW_LABEL, Math.min(340, Math.round(width * 0.23)));
+}
+const FLOW_GAP = 13;          // vertical gap between stacked entries
+const FLOW_MIN = 3;           // a path with any traffic must stay visible
+
+/* Shorten `text` until it fits `maxWidth`, measured on the live element.
+   Binary search rather than a character estimate: the difference between an
+   "i" and a "W" is most of a character width, and the labels here are product
+   names full of both. */
+function fitLabel(node, text, maxWidth) {
+  node.textContent = text;
+  if (!node.getComputedTextLength || node.getComputedTextLength() <= maxWidth) return text;
+  let lo = 1, hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    node.textContent = text.slice(0, mid) + "…";
+    if (node.getComputedTextLength() <= maxWidth) lo = mid;
+    else hi = mid - 1;
+  }
+  const out = text.slice(0, lo).trimEnd() + "…";
+  node.textContent = out;
+  return out;
+}
+
+function svgEl(name, attrs) {
+  const n = document.createElementNS(SVG_NS, name);
+  for (const k of Object.keys(attrs || {})) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+function mapNote() {
+  return "The width of a band is how many records took that path. A device's total is everything it has sent; "
+    + "the split across meanings is measured from the most recent " + FLOW.sampleSize
+    + " records, so it is a proportion from a sample rather than an exact count. "
+    + "The meaning on the right is the OCSF class its Source Pack assigns — ULPF does not judge a record, "
+    + "it records what the device reported.";
+}
+
+/* Build the model from the payloads refresh() already holds. No new endpoint,
+   no extra request, and nothing runs inside the collector's state lock. */
+function flowUpdate(stats, events, packs, clusters) {
+  const byPack = stats.by_pack || {};
+
+  /* "Snort" + "Snort NIDS" reads as "Snort Snort NIDS". A product name that
+     already carries its vendor does not need it twice, and here the label is
+     the whole explanation. */
+  const packName = {};
+  for (const p of (packs || [])) {
+    const vendor = (p.vendor && p.vendor !== "Unknown") ? p.vendor : "";
+    const product = (p.product && p.product !== "Unknown") ? p.product : "";
+    const dup = vendor && product && product.toLowerCase().startsWith(vendor.toLowerCase());
+    packName[p.id] = (dup ? product : [vendor, product].filter(Boolean).join(" ")) || p.id;
+  }
+
+  /* Which meanings each pack produced. The recent-events window holds the last
+     RECENT_CAPACITY records: enough to learn the pairing, not enough to count
+     it. Counts come from by_pack, which is cumulative; the window supplies
+     only the proportions, and a pack that scrolls out keeps its last known
+     ones rather than vanishing from the picture. */
+  const windowed = {};
+  for (const e of (events || [])) {
+    if (!e.pack || e.class_uid === null || e.class_uid === undefined) continue;
+    if (!windowed[e.pack]) windowed[e.pack] = {};
+    windowed[e.pack][e.class_uid] = (windowed[e.pack][e.class_uid] || 0) + 1;
+  }
+  for (const pack of Object.keys(windowed)) {
+    const counts = windowed[pack];
+    let total = 0;
+    for (const k of Object.keys(counts)) total += counts[k];
+    const share = {};
+    for (const k of Object.keys(counts)) share[k] = counts[k] / total;
+    FLOW.shares.set(pack, share);
+  }
+
+  const rows = [];
+  const colTotals = {};
+  const links = [];
+  for (const packId of Object.keys(byPack)) {
+    const count = byPack[packId];
+    if (!count) continue;
+    rows.push({ id: "p:" + packId, kind: "device", label: packName[packId] || packId,
+                sub: packId, value: count });
+    const share = FLOW.shares.get(packId);
+    if (!share) {
+      // Counted by the collector but not present in the sampled window, so
+      // which OCSF class its records became is not known yet.
+      //
+      // This used to `continue`, dropping the source from the picture
+      // entirely. Feed one burst per product and the window holds only the
+      // last of them, so the diagram drew a single band and the counter above
+      // it read "0 products sending logs" while the panel beside it reported
+      // thousands of records normalised by eight packs. A picture that
+      // silently omits its subject is worse than an empty one.
+      colTotals[PENDING] = (colTotals[PENDING] || 0) + count;
+      links.push({ from: "p:" + packId, to: "c:" + PENDING, value: count });
+      continue;
+    }
+    for (const cls of Object.keys(share)) {
+      const value = count * share[cls];
+      colTotals[cls] = (colTotals[cls] || 0) + value;
+      links.push({ from: "p:" + packId, to: "c:" + cls, value: value });
+    }
+  }
+
+  const cols = [];
+  for (const cls of Object.keys(colTotals)) {
+    if (cls === PENDING) {
+      cols.push({ id: "c:" + PENDING, kind: "meaning", label: "Being classified",
+                  under: "counted exactly · class pending",
+                  sub: "awaiting a sampled record", value: colTotals[cls] });
+      continue;
+    }
+    const ocsf = CLASS_NAME[cls] || ("Class " + cls);
+    const plain = plainMeaning(cls);
+    cols.push({
+      id: "c:" + cls, kind: "meaning",
+      label: plain || ocsf,                       // what the picture says
+      under: plain ? ocsf + " · OCSF " + cls : "OCSF class " + cls,  // the standard, quietly
+      sub: "OCSF class " + cls,
+      value: colTotals[cls],
+    });
+  }
+
+  /* Unrecognised traffic is part of the same flow, not a footnote: everything
+     that arrived either became a shared meaning or did not, and a picture that
+     showed only the successes would be making a claim we have not earned. */
+  const unknown = Number(stats.unidentified || 0);
+  if (unknown > 0) {
+    const shapes = (clusters || []).length;
+    rows.push({ id: "u:in", kind: "unknown", value: unknown,
+                // "cannot read" is too strong for a record that was parsed
+                // far enough to be timestamped, fingerprinted and indexed.
+                // What is unrecognised is the product, not the text.
+                label: shapes ? shapes + (shapes === 1 ? " device without a pack"
+                                                      : " devices without a pack")
+                              : "No pack yet",
+                sub: "no Source Pack claims this shape" });
+    cols.push({ id: "u:out", kind: "unknown", label: "Not understood yet",
+                // Not "waiting for someone to teach ULPF this device". That
+                // reads as an apology, and it is not what happened: the
+                // records were read, timestamped, fingerprinted, vaulted and
+                // emitted as valid OCSF. The only thing missing is the vendor
+                // mapping. Say what is true of them, in the same breath as
+                // what is missing, because this band is the one a sceptical
+                // reader looks at hardest.
+                under: "kept in full and searchable · no pack yet",
+                sub: "stored in full, queued for onboarding", value: unknown });
+    links.push({ from: "u:in", to: "u:out", value: unknown });
+  }
+
+  /* Start largest-first in both columns, then reorder to untangle. Volume
+     order alone is what made the first version look messy: the two columns
+     were ranked independently, so a device near the top reached down past
+     three others to a meaning near the bottom while another reached back up.
+     Those crossings carry no information -- they are an artefact of two
+     unrelated sort orders -- and they are most of what the eye reads as mess.
+     Unrecognised sinks to the bottom of each column whatever its size: it is
+     a different kind of thing, and ranking it among the devices would invite
+     reading it as just another one. */
+  const rank = (a, b) =>
+    (a.kind === "unknown") - (b.kind === "unknown") || b.value - a.value;
+  // Hues are handed out before any reordering, from the ids alone, so the
+  // colour a meaning carries never depends on where it happens to sit.
+  const meaningIds = cols.filter((c) => c.kind === "meaning").map((c) => c.id).sort();
+  for (const c of cols) {
+    if (c.kind !== "meaning") continue;
+    c.hue = FLOW_HUES[meaningIds.indexOf(c.id) % FLOW_HUES.length];
+  }
+
+  rows.sort(rank);
+  cols.sort(rank);
+  FLOW.crossings = flowUntangle(rows, cols, links);
+
+  FLOW.rows = rows;
+  FLOW.cols = cols;
+  FLOW.links = links;
+  FLOW.total = rows.reduce((sum, r) => sum + r.value, 0);
+  FLOW.sampleSize = (events || []).length;
+
+  const devices = rows.filter((r) => r.kind === "device").length;
+  const meanings = cols.filter((c) => c.kind === "meaning").length;
+  $("flow-empty").hidden = rows.length > 0;
+  $("map-k-devices").textContent = devices.toLocaleString();
+  $("map-k-meanings").textContent = meanings.toLocaleString();
+  $("map-k-events").textContent = Number(stats.parsed || 0).toLocaleString();
+  $("map-k-unknown").textContent = unknown.toLocaleString();
+  // Say what became of them. "Not recognised" alone reads as "lost", and they
+  // are not: every one is vaulted whole, timestamped from its own line where
+  // the line states a time, and many carry indicators or the field names the
+  // device used. Reported as a share of the unrecognised, never folded into
+  // coverage -- structured is a weaker claim than normalised, and merging the
+  // two would inflate the number the project is judged on.
+  const searchable = Number(stats.searchable_unidentified || 0);
+  $("map-k-unknown-sub").textContent = unknown
+    ? "vaulted intact; " + searchable.toLocaleString() + " of them ("
+      + Math.round((searchable / unknown) * 100) + "%) carry an indicator or a named field"
+    : "vaulted intact; no pack detector matched them";
+  $("flow-sub").textContent = rows.length
+    ? devices + (devices === 1 ? " device" : " devices") + " becoming " + meanings
+      + (meanings === 1 ? " shared meaning" : " shared meanings")
+    : "waiting for traffic";
+  $("map-note").textContent = mapNote();
+
+  mapDraw();
+}
+
+function mapDraw() { flowDraw(); }
+
+/* Reorder both columns so ribbons cross as little as possible.
+   The barycentre heuristic: put each entry at the weighted average position of
+   the things it connects to, sort by that, and sweep the other way. Weighting
+   by record count means a device's dominant meaning decides where it sits
+   rather than a trickle to somewhere else. Three sweeps is enough at these
+   sizes -- the count stops improving long before that -- and the result is
+   deterministic, so the picture does not reshuffle between refreshes.
+   Unrecognised is pinned to the bottom of each column throughout. */
+function flowUntangle(rows, cols, links) {
+  const pinned = (list) => list.filter((n) => n.kind === "unknown");
+  const free = (list) => list.filter((n) => n.kind !== "unknown");
+  const indexOf = (list) => {
+    const m = new Map();
+    list.forEach((n, i) => m.set(n.id, i));
+    return m;
+  };
+  const sweep = (moving, fixedIndex, key) => {
+    const movable = free(moving);
+    const centre = new Map();
+    for (const n of movable) {
+      let weight = 0, sum = 0;
+      for (const l of links) {
+        if (l[key === "from" ? "from" : "to"] !== n.id) continue;
+        const other = fixedIndex.get(key === "from" ? l.to : l.from);
+        if (other === undefined) continue;
+        weight += l.value; sum += l.value * other;
+      }
+      // Nothing to hang off: keep it where it already is rather than
+      // collapsing every unconnected entry onto position zero.
+      centre.set(n.id, weight ? sum / weight : moving.indexOf(n));
+    }
+    movable.sort((a, b) =>
+      centre.get(a.id) - centre.get(b.id) || b.value - a.value);
+    return movable.concat(pinned(moving));
+  };
+
+  // Barycentre usually improves things but is not guaranteed to, so each
+  // sweep is scored and the best arrangement seen is what gets drawn. That
+  // makes the result no worse than the volume ordering it started from.
+  let best = { rows: rows.slice(), cols: cols.slice(),
+               score: flowCrossings(rows, cols, links) };
+  for (let pass = 0; pass < 3; pass++) {
+    const ordered = sweep(rows, indexOf(cols), "from");
+    rows.length = 0; rows.push(...ordered);
+    const orderedCols = sweep(cols, indexOf(rows), "to");
+    cols.length = 0; cols.push(...orderedCols);
+    const score = flowCrossings(rows, cols, links);
+    if (score < best.score) best = { rows: rows.slice(), cols: cols.slice(), score };
+  }
+  rows.length = 0; rows.push(...best.rows);
+  cols.length = 0; cols.push(...best.cols);
+  return best.score;
+}
+
+/* How many pairs of ribbons cross. Two links cross exactly when their
+   endpoints are in opposite vertical order on the two sides. Reported so the
+   untangling can be checked rather than assumed. */
+function flowCrossings(rows, cols, links) {
+  const ri = new Map(rows.map((n, i) => [n.id, i]));
+  const ci = new Map(cols.map((n, i) => [n.id, i]));
+  let n = 0;
+  for (let i = 0; i < links.length; i++) {
+    for (let j = i + 1; j < links.length; j++) {
+      const a = links[i], b = links[j];
+      const dr = ri.get(a.from) - ri.get(b.from);
+      const dc = ci.get(a.to) - ci.get(b.to);
+      if (dr * dc < 0) n++;
+    }
+  }
+  return n;
+}
+
+/* Assign every entry a y position and a height. Two stacking passes and a
+   scale factor -- that is the entire layout, and why it cannot tangle. */
+function flowLayout(width, height) {
+  const inner = height - FLOW_PAD.top - FLOW_PAD.bottom;
+  const place = (list) => {
+    const total = list.reduce((s, n) => s + n.value, 0) || 1;
+    const gaps = FLOW_GAP * Math.max(0, list.length - 1);
+    const usable = Math.max(20, inner - gaps);
+    let y = FLOW_PAD.top;
+    for (const n of list) {
+      n.h = Math.max(FLOW_MIN, (n.value / total) * usable);
+      n.y = y;
+      y += n.h + FLOW_GAP;
+    }
+    // A minimum height for thin entries can push the stack past the bottom.
+    // Squeeze it back rather than letting the last rows fall off the canvas.
+    const overflow = (y - FLOW_GAP) - (height - FLOW_PAD.bottom);
+    if (overflow > 0 && list.length) {
+      const shrink = Math.max(0.25, 1 - overflow / Math.max(1, y - FLOW_PAD.top));
+      let cy = FLOW_PAD.top;
+      for (const n of list) { n.h = Math.max(2, n.h * shrink); n.y = cy; cy += n.h + FLOW_GAP; }
+    }
+  };
+  place(FLOW.rows);
+  place(FLOW.cols);
+
+  const reserve = labelReserve(width);
+  const leftX = FLOW_PAD.left + reserve;
+  const rightX = width - FLOW_PAD.right - reserve - FLOW_BAR;
+  for (const r of FLOW.rows) { r.x = leftX; r.cursor = r.y; }
+  for (const c of FLOW.cols) { c.x = rightX; c.cursor = c.y; }
+  return { leftX, rightX };
+}
+
+function flowDraw() {
+  const svg = $("flow-svg");
+  const width = svg.clientWidth, height = svg.clientHeight;
+  if (!width || !height) return;
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.replaceChildren();
+  if (!FLOW.rows.length) return;
+
+  const { leftX, rightX } = flowLayout(width, height);
+  const byId = new Map();
+  for (const n of FLOW.rows.concat(FLOW.cols)) byId.set(n.id, n);
+  const colour = (n) => n.kind === "device" ? "var(--node-device)"
+    : n.kind === "unknown" ? "var(--node-unknown)" : (n.hue || FLOW_HUES[0]);
+
+  /* Ribbons are drawn largest first so a thin one is never buried under a
+     thick one, and each is anchored by a running cursor on both endpoints so
+     the pieces of a bar meet edge to edge with no gap or overlap. */
+  const ordered = FLOW.links.slice().sort((a, b) => b.value - a.value);
+  const rowScale = FLOW.rows.reduce((s, n) => s + n.value, 0) || 1;
+  const colScale = FLOW.cols.reduce((s, n) => s + n.value, 0) || 1;
+  const gRibbon = svgEl("g", {});
+  svg.append(gRibbon);
+
+  for (const link of ordered) {
+    const a = byId.get(link.from), b = byId.get(link.to);
+    if (!a || !b) continue;
+    const ha = Math.max(1, (link.value / a.value) * a.h);
+    const hb = Math.max(1, (link.value / b.value) * b.h);
+    const y0 = a.cursor, y1 = b.cursor;
+    a.cursor += ha; b.cursor += hb;
+
+    const x0 = leftX + FLOW_BAR, x1 = rightX;
+    const mid = (x0 + x1) / 2;
+    // Two cubics sharing the ribbon's own thickness: the top edge out, the
+    // bottom edge back. A single stroked path could not change width.
+    const d = "M" + x0 + "," + y0
+      + "C" + mid + "," + y0 + " " + mid + "," + y1 + " " + x1 + "," + y1
+      + "L" + x1 + "," + (y1 + hb)
+      + "C" + mid + "," + (y1 + hb) + " " + mid + "," + (y0 + ha) + " " + x0 + "," + (y0 + ha)
+      + "Z";
+    const on = !FLOW.hover || FLOW.hover === a.id || FLOW.hover === b.id;
+    // A ribbon takes the colour of where it ends up, matching that meaning's
+    // bar. With one colour for everything, a path that crosses another is
+    // impossible to follow by eye; with this, it stays followable even where
+    // the untangling could not remove the crossing.
+    const path = svgEl("path", {
+      d: d, class: "ribbon", fill: colour(b),
+      // Same reasoning as the bars: 0.05 was a blackout, and sweeping the
+      // pointer across the picture flashed the whole thing on and off.
+      "fill-opacity": on ? (FLOW.hover ? 0.78 : 0.55) : 0.16,
+      // A hairline of the band's own colour along its edge. Without it two
+      // bands of similar hue that touch read as one wider band.
+      stroke: colour(b), "stroke-opacity": on ? 0.3 : 0.08, "stroke-width": 1,
+    });
+    const pct = FLOW.total ? (link.value / FLOW.total) * 100 : 0;
+    const hint = svgEl("title", {});
+    hint.textContent = a.label + " → " + b.label + ": "
+      + Math.round(link.value).toLocaleString()
+      + " records (" + pct.toFixed(1) + "% of everything received)";
+    path.append(hint);
+    gRibbon.append(path);
+  }
+
+  const drawBar = (n, anchorEnd) => {
+    const dim = FLOW.hover && FLOW.hover !== n.id
+      && !FLOW.links.some((l) => (l.from === n.id && l.to === FLOW.hover)
+                              || (l.to === n.id && l.from === FLOW.hover));
+    // Dimmed, not extinguished. At 0.28 the un-hovered half of the picture
+    // dropped out so hard that moving the pointer across it read as the screen
+    // flashing -- a visitor described it as stinging. 0.55 still tells you what
+    // is connected without punishing you for pointing at something.
+    const g = svgEl("g", { opacity: dim ? 0.55 : 1, class: "flow-bar-group" });
+    g.append(svgEl("rect", {
+      x: n.x, y: n.y, width: FLOW_BAR, height: n.h, rx: FLOW_BAR / 2,
+      fill: colour(n), class: "bar",
+    }));
+    const tx = anchorEnd ? n.x - 10 : n.x + FLOW_BAR + 10;
+    // Appended to the group up front: getComputedTextLength only reports a
+    // width for an element the renderer has actually laid out.
+    const label = svgEl("text", {
+      x: tx, y: n.y + n.h / 2 - 2, class: "lbl",
+      "text-anchor": anchorEnd ? "end" : "start", "dominant-baseline": "middle",
+    });
+    // Truncate to the space actually reserved, measured, not to a character
+    // count. A 34-character limit let "Apache HTTP Server (NCSA combined)"
+    // through at exactly 34 and it ran off the left edge of the panel: the
+    // reserve is in pixels and proportional text has no fixed character width.
+    // Set in full here and shortened after the group is in the document --
+    // getComputedTextLength only reports a width for a laid-out element.
+    label.textContent = n.label;
+    label.dataset.full = n.label;
+    // The count only. The percentage was a second number competing with the
+    // first for no gain -- the band's own width already says "share", and a
+    // reader who wants the exact figure gets it on hover.
+    const amount = svgEl("text", {
+      x: tx, y: n.y + n.h / 2 + 12, class: "amt",
+      "text-anchor": anchorEnd ? "end" : "start", "dominant-baseline": "middle",
+    });
+    amount.textContent = Math.round(n.value).toLocaleString() + " logs";
+    amount.dataset.full = amount.textContent;
+    // The OCSF name, small and grey, under the plain one. A jury reads the
+    // line above it; a technical judge sees the standard is really there.
+    const under = n.under ? svgEl("text", {
+      x: tx, y: n.y + n.h / 2 + 25, class: "ocsf",
+      "text-anchor": anchorEnd ? "end" : "start", "dominant-baseline": "middle",
+    }) : null;
+    if (under) {
+      under.textContent = n.under;
+      under.dataset.full = n.under;
+    }
+    // Only label a band tall enough to hold the text; a sliver would print its
+    // name straight through its neighbour's.
+    if (n.h >= 34 && under) { g.append(label); g.append(amount); g.append(under); }
+    else if (n.h >= 15) { g.append(label); g.append(amount); }
+    else if (n.h >= 7) { label.setAttribute("y", n.y + n.h / 2); g.append(label); }
+    g.dataset.id = n.id;
+    // Do not append an SVG <title> here. The map already has a richer custom
+    // tooltip; using both makes browsers display two explanations at once.
+    return g;
+  };
+
+  const gNodes = svgEl("g", {});
+  for (const r of FLOW.rows) gNodes.append(drawBar(r, true));
+  for (const c of FLOW.cols) gNodes.append(drawBar(c, false));
+  svg.append(gNodes);
+
+  // Now that they are laid out, shorten any label wider than the space
+  // reserved for it. "Apache HTTP Server (NCSA combined)" used to run off the
+  // left edge of the panel because the old limit counted characters while the
+  // reserve is in pixels.
+  // Every line, not only the main label. The count and the OCSF caption were
+  // never measured, so a long caption -- the unrecognised band's especially --
+  // ran past the gutter and off the edge of the panel. They share the label's
+  // reserve because they sit in the same column.
+  const reserve = labelReserve(svg.clientWidth || width) - 14;
+  for (const node of gNodes.querySelectorAll("text.lbl, text.amt, text.ocsf")) {
+    fitLabel(node, node.dataset.full || node.textContent, reserve);
+  }
+}
+
+/* An exploratory, Obsidian-inspired companion to the precise flow diagram.
+   It intentionally uses the same FLOW model: no decorative or fabricated
+   nodes. A stable three-zone layout keeps labels legible while circles and
+   neighbourhood highlighting provide the visual language of a knowledge
+   graph. */
+/* ------------------------------------------------- before / after strip */
+/* Three records that arrived in the last few seconds, from three different
+   products, each with the bytes the device actually wrote next to the answers
+   ULPF pulled out. The raw text is different every time and the question
+   labels never change, which is the whole argument in a form that needs no
+   vocabulary to follow.
+   (This state block was removed by mistake when the ring chart and globe were
+   cut out, and the strip threw on every poll until it came back.) */
+const ROS = { pick: [], at: 0, loading: false, lastSwap: 0 };
+const ROS_ROTATE_MS = 9000;
+
+/* Prefer records that answer the questions the card asks. A parsed record with
+   no addresses makes a card of three dashes, which argues nothing. */
+function rosScore(e) {
+  let s = 0;
+  if (e.src_ip) s += 3;
+  if (e.dst_ip) s += 5;   // both endpoints makes the strongest card
+  if (e.class_uid !== null && e.class_uid !== undefined) s += 2;
+  if (e.locator) s += 1;
+  return s;
+}
+
+/* One record per pack, best first: three cards from the same product would
+   show three near-identical lines and prove nothing about heterogeneity. */
+function rosChoose(events) {
+  const best = new Map();
+  for (const e of events) {
+    if (!e.pack || e.disposition !== "parsed" || !e.locator) continue;
+    const cur = best.get(e.pack);
+    if (!cur || rosScore(e) > rosScore(cur)) best.set(e.pack, e);
+  }
+  return [...best.values()].sort((a, b) => rosScore(b) - rosScore(a));
+}
+
+function rosMeaning(e) {
+  const name = CLASS_NAME[e.class_uid];
+  const acts = ACTIVITY[e.class_uid];
+  const act = acts && acts[e.activity_id];
+  if (!name) return e.class_uid ? "Class " + e.class_uid : "—";
+  return act ? name + " · " + act : name;
+}
+
+/* An em dash reads as "this tool failed". The truth is narrower and better
+   for us: the device never wrote that field, and ULPF did not invent one. Say
+   so, in the same words a non-technical reader would use. */
+function rosEndpoint(ip, port) {
+  if (!ip) return "not stated by the device";
+  return port ? ip + " : " + port : String(ip);
+}
+
+function rosCard(entry) {
+  const e = entry.event;
+  const card = el("div", "roscard");
+  const product = [e.vendor, e.product]
+    .filter((x) => x && x !== "Unknown")
+    .filter((x, i, a) => i === 0 || !String(x).toLowerCase().startsWith(String(a[0]).toLowerCase()))
+    .join(" ") || e.pack || "Unknown device";
+  const who = el("div", "who", product);
+  who.title = product;
+  card.append(who);
+
+  card.append(el("div", "step", "What the device wrote"));
+  const raw = el("div", "rawline", entry.raw || "(original text not retrievable)");
+  card.append(raw);
+
+  const arrow = el("div", "rosarrow");
+  arrow.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M6 13l6 6 6-6"/></svg>';
+  card.append(arrow);
+
+  card.append(el("div", "step", "What ULPF understood"));
+  const dl = el("dl");
+  const add = (k, v, mono) => {
+    dl.append(el("dt", null, k));
+    dl.append(el("dd", mono ? "mono" : null, v));
+  };
+  add("Who started it", rosEndpoint(e.src_ip, e.src_port), !!e.src_ip);
+  add("Who it reached", rosEndpoint(e.dst_ip, e.dst_port), !!e.dst_ip);
+  add("When", fmtTime(e.time) || "not stated by the device");
+  card.append(dl);
+  card.append(el("div", "meaning", rosMeaning(e)));
+  return card;
+}
+
+/* Fetch the originals for the chosen records, then render. One request per
+   card, at most three, and only when the selection changes -- not on every
+   two-second poll, which would read the vault 90 times a minute for a panel
+   nobody is looking at. */
+async function rosRender(chosen) {
+  if (ROS.loading) return;
+  ROS.loading = true;
+  try {
+    const entries = await Promise.all(chosen.map(async (event) => {
+      try {
+        const data = await api("/api/raw/" + encodeURIComponent(event.locator));
+        return { event, raw: (data && data.text) ? String(data.text).trim() : null };
+      } catch (err) {
+        return { event, raw: null };
+      }
+    }));
+    const cols = $("ros-cols");
+    cols.replaceChildren();
+    for (const entry of entries) cols.append(rosCard(entry));
+    $("ros-sub").textContent = entries.length
+      + (entries.length === 1 ? " record, live from the vault" : " records, live from the vault");
+  } finally {
+    ROS.loading = false;
+  }
+}
+
+/* Rotate through the products rather than pinning the same three: with nine
+   sources running, a fixed three hides two thirds of the argument. */
+function rosUpdate(events, force) {
+  const ranked = rosChoose(events || []);
+  if (!ranked.length) {
+    $("ros-cols").replaceChildren(el("div", "rosempty",
+      "Nothing to show yet. Once records arrive, three of them appear here with the original text beside what ULPF made of it."));
+    $("ros-sub").textContent = "waiting for traffic";
+    return;
+  }
+  const now = performance.now();
+  if (!force && ROS.lastSwap && now - ROS.lastSwap < ROS_ROTATE_MS) return;
+  ROS.lastSwap = now;
+  if (force) ROS.at = (ROS.at + 3) % Math.max(1, ranked.length);
+  const chosen = [];
+  for (let i = 0; i < Math.min(3, ranked.length); i++) {
+    chosen.push(ranked[(ROS.at + i) % ranked.length]);
+  }
+  if (!force) ROS.at = (ROS.at + 3) % ranked.length;
+  rosRender(chosen);
+}
+
+$("ros-next").addEventListener("click", () => rosUpdate(latestEvents, true));
+
+
+/* ------------------------------------------------------ tabs on Live Map */
+/* Three ways of looking at the same collector. The flow diagram answers
+   "where does everything end up", the globe answers "is anything arriving
+   right now", the trend answers "how much, and is it keeping up". Only the
+   visible one animates -- the collector shares this machine. */
+/* Plain-language explainer per tab. Deliberately free of jargon: the reader
+   this is written for has never opened a log file, and every sentence they
+   cannot parse is a sentence that makes the project look complicated rather
+   than useful. Each entry is one sentence saying what the picture is, then
+   three short steps saying how to read it. */
+const LEDE = {
+  flow: {
+    what: 'Every product writes its logs in its own way, so a security team cannot search across all of them at '
+        + 'once. ULPF reads each one and rewrites it into <b>one shared set of meanings</b>. '
+        + '<b>On the left is what sent the log. On the right is what it became.</b> Follow any band across.',
+    steps: [
+      ['Left side: the products', 'Nine different things here — an intrusion detector, a firewall, a web server, a mail server. Each writes logs nothing else can read.'],
+      ['Right side: plain meanings', 'The same handful of statements, whatever sent them. One search now works across every product on the left.'],
+      ['Red is the honest part', 'Anything ULPF cannot read yet is kept exactly as it arrived, never dropped, and shown here rather than hidden.'],
+    ],
+  },
+  trend: {
+    what: 'How much work ULPF is doing. <b>Each point is one measurement</b>: how many logs arrived in the last '
+        + 'couple of seconds. A line climbing means more traffic; a flat line along the bottom means nothing is '
+        + 'being sent right now.',
+    steps: [
+      ['The four numbers', 'What is arriving now, the busiest it has been, its usual speed, and how much of everything it understood.'],
+      ['Steady is healthy', 'The line should track the traffic. It keeping up is the point.'],
+      ['Hover anywhere', 'Reads back the exact speed at that moment and how long ago it was.'],
+    ],
+  },
+};
+
+function ledeShow(name) {
+  const entry = LEDE[name];
+  if (!entry) return;
+  $("lede-what").innerHTML = entry.what;
+  const list = $("lede-steps");
+  list.replaceChildren();
+  for (const [title, body] of entry.steps) {
+    const li = el("li");
+    li.append(el("b", null, title), document.createTextNode(body));
+    list.append(li);
+  }
+}
+
+(function tabs() {
+  const buttons = [...document.querySelectorAll(".tabbar .tab")];
+  function select(name) {
+    ledeShow(name);
+    for (const b of buttons) b.setAttribute("aria-selected", String(b.dataset.tab === name));
+    for (const b of buttons) {
+      const panel = $("tab-" + b.dataset.tab);
+      if (panel) panel.hidden = b.dataset.tab !== name;
+    }
+    // Both drawings size themselves from their container, which measures zero
+    // while hidden, so each needs a redraw on the frame after it is shown.
+    requestAnimationFrame(() => {
+      if (name === "flow") mapDraw();
+      if (name === "trend") trendDraw();
+    });
+  }
+  for (const b of buttons) b.addEventListener("click", () => select(b.dataset.tab));
+  window.__mapSelectTab = select;
+  const initial = buttons.find((b) => b.getAttribute("aria-selected") === "true");
+  ledeShow(initial ? initial.dataset.tab : "flow");
+})();
+
+/* --------------------------------------------------- throughput over time */
+/* Records per second, measured in the browser from the same two-second poll
+   the rest of the console runs on. Every point is a real measurement: the
+   difference in `received` between two polls divided by the seconds between
+   them. Nothing is smoothed or interpolated -- a flat line means the
+   collector really was idle.
+
+   Kept client-side deliberately. The collector does not retain a time series
+   and adding one would mean state, a lock and a retention policy for a number
+   the console can derive itself. The cost is that history starts when the page
+   opens, which the empty state says out loud rather than implying the graph is
+   the whole story. */
+
+const TREND = {
+  points: [],            // { t: ms, eps: number }
+  lastReceived: null,
+  lastAt: 0,
+  peak: 0,
+  hover: null,
+};
+const TREND_WINDOW_MS = 6 * 60 * 1000;   // six minutes of history
+const TREND_PAD = { top: 18, right: 18, bottom: 26, left: 56 };
+
+function trendUpdate(stats) {
+  const now = performance.now();
+  const received = Number(stats.received || 0);
+  if (TREND.lastReceived !== null && now > TREND.lastAt) {
+    const seconds = (now - TREND.lastAt) / 1000;
+    // A restarted collector resets its counter; a negative delta is that, not
+    // negative throughput, so it starts a fresh baseline instead of a spike.
+    const delta = received - TREND.lastReceived;
+    if (delta >= 0 && seconds > 0.4) {
+      const eps = delta / seconds;
+      TREND.points.push({ t: now, eps });
+      TREND.peak = Math.max(TREND.peak, eps);
+    }
+  }
+  TREND.lastReceived = received;
+  TREND.lastAt = now;
+  while (TREND.points.length && now - TREND.points[0].t > TREND_WINDOW_MS) TREND.points.shift();
+
+  const live = TREND.points.filter((p) => p.eps > 0);
+  const current = TREND.points.length ? TREND.points[TREND.points.length - 1].eps : 0;
+  const average = live.length ? live.reduce((s, p) => s + p.eps, 0) / live.length : 0;
+  $("tr-now").textContent = Math.round(current).toLocaleString();
+  $("tr-peak").textContent = Math.round(TREND.peak).toLocaleString();
+  $("tr-avg").textContent = Math.round(average).toLocaleString();
+  $("tr-cov").textContent = stats.received
+    ? ((stats.coverage || 0) * 100).toFixed(2) + "%" : "—";
+  $("trend-sub").textContent = TREND.points.length
+    ? TREND.points.length + " measurements, newest on the right"
+    : "collecting";
+  $("trend-empty").hidden = TREND.points.length > 1;
+  $("trend-note").textContent =
+    "Each point is one measurement: how many records arrived between two refreshes, divided by the seconds "
+    + "between them. History starts when this page was opened and covers the last six minutes.";
+  trendDraw();
+}
+
+function trendDraw() {
+  const svg = $("trend-svg");
+  const w = svg.clientWidth, h = svg.clientHeight;
+  if (!w || !h) return;
+  svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+  svg.replaceChildren();
+  const pts = TREND.points;
+  if (pts.length < 2) return;
+
+  const x0 = TREND_PAD.left, x1 = w - TREND_PAD.right;
+  const y0 = TREND_PAD.top, y1 = h - TREND_PAD.bottom;
+  const tMin = pts[0].t, tMax = pts[pts.length - 1].t;
+  const span = Math.max(1, tMax - tMin);
+  // Headroom above the peak so the line never touches the top edge, and a
+  // floor so an idle collector does not draw a flat line at full scale.
+  const peak = Math.max(10, ...pts.map((p) => p.eps)) * 1.15;
+
+  const sx = (t) => x0 + ((t - tMin) / span) * (x1 - x0);
+  const sy = (v) => y1 - (v / peak) * (y1 - y0);
+
+  const svgn = svgEl;   // the file already has this helper
+
+  // Horizontal guides, labelled. Four is enough to read a value off without
+  // turning the plot into graph paper.
+  for (let i = 0; i <= 4; i++) {
+    const v = (peak / 4) * i;
+    const y = sy(v);
+    svg.append(svgn("line", {
+      x1: x0, x2: x1, y1: y, y2: y,
+      stroke: "var(--border)", "stroke-width": 1,
+      "stroke-dasharray": i === 0 ? "" : "3 5",
+    }));
+    const label = svgn("text", { x: x0 - 9, y: y, "text-anchor": "end", "dominant-baseline": "middle" });
+    label.textContent = Math.round(v).toLocaleString();
+    svg.append(label);
+  }
+
+  const path = pts.map((p, i) => (i ? "L" : "M") + sx(p.t).toFixed(1) + "," + sy(p.eps).toFixed(1)).join("");
+
+  const gradId = "trend-fill";
+  const defs = svgn("defs", {});
+  const grad = svgn("linearGradient", { id: gradId, x1: "0", y1: "0", x2: "0", y2: "1" });
+  const s1 = svgn("stop", { offset: "0%", "stop-color": "var(--primary)", "stop-opacity": "0.26" });
+  const s2 = svgn("stop", { offset: "100%", "stop-color": "var(--primary)", "stop-opacity": "0" });
+  grad.append(s1, s2); defs.append(grad); svg.append(defs);
+
+  svg.append(svgn("path", {
+    d: path + "L" + sx(tMax).toFixed(1) + "," + y1 + "L" + sx(tMin).toFixed(1) + "," + y1 + "Z",
+    fill: "url(#" + gradId + ")",
+  }));
+  svg.append(svgn("path", {
+    d: path, fill: "none", stroke: "var(--primary)",
+    "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round",
+  }));
+
+  // The newest reading, marked and labelled: on a live chart that is the
+  // number anyone is actually looking for.
+  const last = pts[pts.length - 1];
+  svg.append(svgn("circle", {
+    cx: sx(last.t), cy: sy(last.eps), r: 4.5,
+    fill: "var(--primary)", stroke: "var(--panel)", "stroke-width": 2,
+  }));
+
+  const secondsAgo = Math.round((tMax - tMin) / 1000);
+  const left = svgn("text", { x: x0, y: y1 + 15, "text-anchor": "start" });
+  left.textContent = secondsAgo >= 60
+    ? Math.round(secondsAgo / 60) + " min ago"
+    : secondsAgo + "s ago";
+  const right = svgn("text", { x: x1, y: y1 + 15, "text-anchor": "end" });
+  right.textContent = "now";
+  svg.append(left, right);
+
+  if (TREND.hover) {
+    const hx = sx(TREND.hover.t);
+    svg.append(svgn("line", {
+      x1: hx, x2: hx, y1: y0, y2: y1,
+      stroke: "var(--primary)", "stroke-width": 1, "stroke-dasharray": "3 3", "stroke-opacity": "0.6",
+    }));
+    svg.append(svgn("circle", {
+      cx: hx, cy: sy(TREND.hover.eps), r: 4,
+      fill: "var(--primary)", stroke: "var(--panel)", "stroke-width": 2,
+    }));
+  }
+}
+
+(function trendBindInput() {
+  const svg = $("trend-svg");
+  const tip = $("trend-tip");
+  svg.addEventListener("pointermove", (e) => {
+    const pts = TREND.points;
+    if (pts.length < 2) return;
+    const box = svg.getBoundingClientRect();
+    const x = e.clientX - box.left, y = e.clientY - box.top;
+    const x0 = TREND_PAD.left, x1 = svg.clientWidth - TREND_PAD.right;
+    const tMin = pts[0].t, tMax = pts[pts.length - 1].t;
+    const t = tMin + ((x - x0) / Math.max(1, x1 - x0)) * (tMax - tMin);
+    let nearest = pts[0];
+    for (const p of pts) if (Math.abs(p.t - t) < Math.abs(nearest.t - t)) nearest = p;
+    TREND.hover = nearest;
+    trendDraw();
+    const ago = Math.round((tMax - nearest.t) / 1000);
+    tip.replaceChildren(
+      el("b", null, Math.round(nearest.eps).toLocaleString() + " records/sec"),
+      el("div", "m", ago === 0 ? "just now" : ago + " seconds ago")
+    );
+    tip.classList.add("on");
+    tip.style.left = Math.min(x + 14, Math.max(8, svg.clientWidth - 190)) + "px";
+    tip.style.top = Math.max(8, y - 12) + "px";
+  });
+  svg.addEventListener("pointerleave", () => {
+    if (TREND.hover) { TREND.hover = null; trendDraw(); }
+    tip.classList.remove("on");
+  });
+
+  /* Full screen, for both panels. `flow-full` sat in the markup from the start
+     with nothing listening to it -- a button that looked live and did nothing
+     on every click. Binding is shared now so the two cannot drift apart. */
+  function bindFullScreen(buttonId, panelId) {
+    const button = $(buttonId), panel = $(panelId);
+    if (!button || !panel) return;
+    if (!panel.requestFullscreen) {
+      button.textContent = "Full screen unavailable";
+      button.disabled = true;
+      return;
+    }
+    button.addEventListener("click", () => {
+      if (document.fullscreenElement) { document.exitFullscreen(); return; }
+      panel.requestFullscreen().catch(() => {
+        button.textContent = "Full screen unavailable";
+        button.disabled = true;
+      });
+    });
+  }
+  bindFullScreen("trend-full", "trend-panel");
+  bindFullScreen("flow-full", "flow-panel");
+  document.addEventListener("fullscreenchange", () => {
+    requestAnimationFrame(() => { trendDraw(); mapDraw(); });
+  });
+
+  let timer = 0;
+  window.addEventListener("resize", () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(trendDraw, 90);
+  });
+})();
+
+window.flowDraw = flowDraw;
+
+refresh();
+setInterval(refresh, 2000);
+</script>

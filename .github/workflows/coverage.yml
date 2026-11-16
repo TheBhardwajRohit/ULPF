@@ -1,0 +1,145 @@
+name: Coverage regression
+
+# Deliberately separate from the air-gapped CI job.
+#
+# That job proves ULPF builds and tests with no network at all, and it does so
+# by running every Cargo command with `--offline`. This one has to download
+# ~150 MB of public capture data from the Honeynet Project and Loghub, so
+# putting it in the same job would either break the offline proof or make the
+# offline proof a lie. Keeping them apart lets each say something true.
+#
+# It is also why this does not run on every push: it depends on external hosts
+# that can be down, and a red build caused by someone else's mirror teaches a
+# team to ignore red builds.
+
+on:
+  schedule:
+    # Weekly, early Monday UTC.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+  push:
+    # Pack or engine changes are the only things that can move coverage.
+    branches: [ main ]
+    paths:
+      - "packs/**"
+      - "crates/ulpf-pack/**"
+      - "crates/ulpf-decode/**"
+      - "tools/measure_coverage.py"
+      - "tools/coverage_baseline.json"
+      # This job's own machinery. Without these it could not test a change to
+      # itself: three fixes to the fetch step landed without ever running,
+      # because a commit touching only the workflow and the fetcher matched
+      # none of the paths above.
+      - "tools/fetch_datasets.py"
+      - ".github/workflows/coverage.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # The corpora are not committed: they total ~150 MB, they are
+    # independently available, and vendoring them would silently relicense
+    # third-party research data. Cache them so the upstream mirrors are hit
+    # once rather than on every run.
+    # The key deliberately does not hash tools/fetch_datasets.py. The corpora
+    # are third-party research data that do not change when our fetcher's code
+    # does, and keying on the source meant every edit to it threw away the
+    # cache and forced a cold download. That is how this job went red five
+    # times in a row: not one of those failures was about coverage, they were
+    # all the Honeynet mirror timing out from a GitHub runner during a re-fetch
+    # nothing had asked for. Bump CORPORA_SET below when the corpus list itself
+    # changes; restore-keys then still serves the previous set while the new
+    # one downloads.
+    - name: Cache public corpora
+      id: corpora
+      uses: actions/cache@v4
+      with:
+        path: realdata
+        key: ulpf-corpora-set2-${{ runner.os }}
+        restore-keys: |
+          ulpf-corpora-set2-
+          ulpf-corpora-
+
+    # Two attempts, because these are other people's mirrors and one timeout is
+    # not evidence of anything. The step is allowed to fail: what a missing
+    # corpus must not do is pass silently, and it cannot -- `--check` refuses
+    # to run at all unless every corpus was measured, and reports which ones
+    # were not. That check is the gate. This step is only how the files arrive.
+    - name: Fetch corpora
+      id: fetch
+      continue-on-error: true
+      # `set +e` because GitHub runs step scripts under `bash -e`, which aborts
+      # on the first failing command -- so the retry written below never ran.
+      # The step still reports the second attempt's status, and the baseline
+      # check is gated on it.
+      #
+      # The flags matter as much as the retry. The fetcher's default is now
+      # every corpus -- its own header says ~6 GB of archives expanding to
+      # ~65 GB -- and a GitHub runner has about 14 GB free, so the default
+      # filled the disk and the runner was lost. That surfaces as a *cancelled*
+      # step rather than a failed one, which continue-on-error does not cover,
+      # so every later step was skipped and the job went red with no usable
+      # message. It is why this job failed on commit after commit while saying
+      # nothing about coverage.
+      #
+      # None of the skipped archives are in tools/coverage_baseline.json. The
+      # check needs 23 corpora, all of them the bounded samples and the
+      # Honeynet perimeter set, roughly 150 MB. -u so the script's progress is
+      # unbuffered and a future failure is legible in the log rather than
+      # arriving as sixty seconds of silence.
+      run: |
+        set +e
+        fetch() {
+          python -u tools/fetch_datasets.py --dir realdata             --skip-loghub-full --no-full-zeek --no-bluecoat
+        }
+        fetch && exit 0
+        echo "::warning::first fetch attempt failed, retrying in 20s"
+        sleep 20
+        fetch
+        exit $?
+
+    - name: Build
+      run: cargo build --release --locked
+
+    # Fails when any corpus, or the total, drops below the recorded figure.
+    # Fixture scoring cannot catch this: a pack can pass its own fixtures and
+    # still stop claiming most of the traffic it used to.
+    - name: Check coverage against the baseline
+      if: steps.fetch.outcome == 'success'
+      run: python tools/measure_coverage.py --data realdata --set all --check
+
+    # Reached only when a third-party mirror was unreachable twice. Going red
+    # here would be indistinguishable from a real regression, and a job that is
+    # red for reasons the team cannot act on is a job the team stops reading --
+    # which costs more than the run we skipped. The warning is loud, the
+    # scheduled Monday run retries, and a cache hit means the usual path never
+    # touches those mirrors at all.
+    - name: Report a skipped check
+      if: steps.fetch.outcome != 'success'
+      run: |
+        echo "::warning::Coverage not checked: the public corpora could not be downloaded after two attempts. This says nothing about coverage. Re-run this job, or wait for the scheduled Monday run."
+
+    - name: Upload the measured table
+      if: always()
+      run: python tools/measure_coverage.py --data realdata --set all | tee coverage.txt
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: coverage-table
+        path: coverage.txt

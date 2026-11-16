@@ -1,0 +1,64 @@
+[package]
+name = "ulpf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line interface for the Universal Log Pre-processing Framework"
+
+[[bin]]
+name = "ulpf"
+path = "src/main.rs"
+
+[dependencies]
+ulpf-core = { workspace = true }
+ulpf-ocsf = { workspace = true }
+ulpf-vault = { workspace = true }
+ulpf-decode = { workspace = true }
+ulpf-pack = { workspace = true }
+ulpf-generator = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# For `ulpf healthcheck` only. Already in the tree via ulpf-generator, so this
+# adds a declaration rather than a dependency.
+reqwest = { version = "0.13.4" }
+notify = "8.2.0"
+chrono = "0.4.45"
+socket2 = "0.6.5"
+# TLS termination for the console. rustls rather than a system-OpenSSL
+# binding, so a Windows build needs no separate OpenSSL install and the
+# air-gapped/container story (README, requirement j) is unaffected.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Generates the optional self-signed certificate. Pure Rust, no OpenSSL, so it
+# does not change what has to be present on an air-gapped build host.
+rcgen = "0.13"
+# Encryption at rest for the Ed25519 signing key (--encrypt-key). AEAD cipher
+# for the key bytes; Argon2id to turn an operator passphrase into a key the
+# cipher can use. Both pure Rust, same reasoning as the TLS crates above.
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+# Hides passphrase input at the terminal instead of echoing it. Only used
+# interactively; ULPF_KEY_PASSPHRASE bypasses it for scripted/CI runs.
+rpassword = "7"
+
+[dev-dependencies]
+criterion = "0.7.0"
+# `oneshot`, for driving the real router in tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[[bench]]
+name = "bench"
+harness = false
+

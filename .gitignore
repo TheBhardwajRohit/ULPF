@@ -1,0 +1,44 @@
+/target/
+/data/
+
+# Public log corpora, fetched by tools/fetch_datasets.py. Up to ~62 GB at the
+# `xl` tier. They live inside the project so that one `rm -rf` cleans up after
+# it, and they are ignored here so third-party research data is never pushed:
+# vendoring it would silently relicense someone else's dataset.
+/realdata/
+
+/testdata/bench.log
+/testdata/real/
+*.ndjson
+*.vlt
+*.key
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# The tools/ scripts are run directly and imported by their own checks, so
+# CPython leaves bytecode behind next to them.
+__pycache__/
+*.pyc
+
+# Holds real console tokens for the demo-day traffic switch (see
+# demo-switch.ps1) -- a credential, never committed.
+/tools/demo-switch.local.ps1
+
+# Documentation evidence is intentionally versioned.
+!/docs/screenshots/*.png
+
+# Manim virtual environment and rendered video output.
+.venv-manim/
+media/
+
+# Collector output when the console is run in the background during development.
+/serve.log
+
+# working documents, never shipped
+.work/
+
+# measurement scratch, written beside the corpora
+/realdata/.measure-work/

@@ -1,0 +1,1804 @@
+//! Local model integration for drafting Source Packs.
+//!
+//! Talks to a model server running on the same host — Ollama by default, or a
+//! `llama.cpp` server — so the whole loop stays inside the air gap.
+//!
+//! # Why the model is asked for a small JSON object, not a Pack
+//!
+//! A Source Pack is a large nested document, and a 1.5B-parameter model asked
+//! to emit one verbatim will usually produce something that is *almost* valid
+//! YAML. Instead the model is asked for a handful of decisions it is actually
+//! good at — which vendor this looks like, which substrings identify it, which
+//! decoders to chain, which source field maps to which OCSF attribute — and
+//! this crate assembles the Pack from that in Rust. Structure is a job for
+//! code; recognition is the job for the model.
+//!
+//! Ollama's `format: "json"` constrains decoding to syntactically valid JSON,
+//! which removes the single largest failure mode.
+//!
+//! # No silent fallbacks
+//!
+//! If the model is unreachable or returns something unusable, this returns an
+//! error saying so. An earlier version quietly substituted a hand-written
+//! "mock" pack, which would have presented fabricated output as generated work.
+
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use ulpf_pack::spec::{Detector, ExtractStep, Fixture, Identity, MapSpec, Pack, Provenance};
+
+/// Which local model server to talk to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Ollama: `POST /api/generate`, supports `format: "json"`.
+    Ollama,
+    /// llama.cpp server: `POST /completion`.
+    LlamaCpp,
+}
+
+pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434";
+pub const DEFAULT_MODEL: &str = "qwen2.5:1.5b-instruct";
+
+/// OCSF attributes the drafter may target. Keeping the list short keeps the
+/// model on paths that actually exist in the schema, and lets an out-of-range
+/// suggestion be rejected rather than compiled into a broken pack.
+///
+/// `url` was here until it was checked against `schema/ocsf/objects/url.json`:
+/// `url` is an *object* (with its own `url_string`, `hostname`, `path`, ...
+/// attributes), so mapping a source field directly onto it would have set an
+/// object-typed attribute to a bare string — compiles fine, passes a fixture
+/// that only checks the string survived, and produces an event no OCSF
+/// consumer reads correctly. `crate::ocsf_paths` now checks every path this
+/// module can produce against the vendored schema so this class of mistake
+/// gets caught before a candidate reaches approval, not after.
+const ALLOWED_FIELDS: &[&str] = &[
+    "src_endpoint.ip",
+    "src_endpoint.port",
+    "dst_endpoint.ip",
+    "dst_endpoint.port",
+    "connection_info.protocol_name",
+    "device.hostname",
+    "actor.user.name",
+    "url.url_string",
+    "message",
+];
+
+#[derive(Clone)]
+pub struct GeneratorClient {
+    endpoint: String,
+    model: String,
+    backend: Backend,
+    client: reqwest::Client,
+}
+
+/// The small decision object the model is asked to fill in.
+#[derive(Debug, Deserialize)]
+struct DraftSpec {
+    #[serde(default)]
+    vendor: String,
+    #[serde(default)]
+    product: String,
+    #[serde(default)]
+    log_format: String,
+    /// OCSF attribute path -> source field name produced by the decoders.
+    #[serde(default)]
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct OllamaRequest<'a> {
+    model: &'a str,
+    prompt: String,
+    stream: bool,
+    format: &'a str,
+    options: OllamaOptions,
+}
+
+#[derive(Serialize)]
+struct OllamaOptions {
+    temperature: f64,
+    num_predict: u32,
+    /// Penalise tokens seen recently. Without this a small model happily
+    /// repeats one sentence until it runs out of budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f64>,
+    /// How far back the penalty looks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_last_n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    response: String,
+}
+
+/// Cut a reply short once it starts repeating itself.
+///
+/// Sampling penalties reduce looping but do not eliminate it on a 1.5B model.
+/// If the same line comes back three times, everything from the second
+/// occurrence onward is noise, so it is dropped rather than shown.
+pub fn trim_degenerate_repetition(reply: &str) -> String {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut kept: Vec<&str> = Vec::new();
+
+    for line in reply.lines() {
+        let key = line.trim();
+        if key.len() > 25 {
+            let count = seen.entry(key).or_insert(0);
+            *count += 1;
+            if *count >= 3 {
+                break;
+            }
+        }
+        kept.push(line);
+    }
+
+    let mut out = kept
+        .join(
+            "
+",
+        )
+        .trim_end()
+        .to_string();
+
+    // Same collapse, but within a single unbroken paragraph.
+    if let Some(trimmed) = trim_repeated_sentence(&out) {
+        out = trimmed;
+    }
+    if out.trim().is_empty() {
+        return reply.trim().chars().take(600).collect();
+    }
+    out
+}
+
+fn trim_repeated_sentence(text: &str) -> Option<String> {
+    let sentences: Vec<&str> = text.split_inclusive(". ").collect();
+    if sentences.len() < 4 {
+        return None;
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut cut = None;
+    for (i, s) in sentences.iter().enumerate() {
+        let key = s.trim();
+        if key.len() > 25 {
+            let c = seen.entry(key).or_insert(0);
+            *c += 1;
+            if *c >= 3 {
+                cut = Some(i);
+                break;
+            }
+        }
+    }
+    cut.map(|i| sentences[..i].concat().trim_end().to_string())
+}
+
+/// One turn in a conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// `system`, `user` or `assistant`.
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Serialize)]
+struct OllamaChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+    options: OllamaOptions,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponse {
+    message: ChatMessage,
+}
+
+#[derive(Serialize)]
+struct LlamaCppRequest {
+    prompt: String,
+    n_predict: u32,
+    temperature: f64,
+}
+
+#[derive(Deserialize)]
+struct LlamaCppResponse {
+    content: String,
+}
+
+/// How long to wait for the model server to answer a liveness check.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl GeneratorClient {
+    pub fn new(endpoint: &str, model: &str, backend: Backend) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            backend,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Build from the environment, so an operator can point at whatever model
+    /// server the air-gapped host runs without a rebuild.
+    ///
+    /// `ULPF_LLM_ENDPOINT`, `ULPF_LLM_MODEL`, `ULPF_LLM_BACKEND`
+    /// (`ollama` | `llamacpp`).
+    pub fn from_env() -> Self {
+        let endpoint =
+            std::env::var("ULPF_LLM_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        let model = std::env::var("ULPF_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let backend = match std::env::var("ULPF_LLM_BACKEND").as_deref() {
+            Ok("llamacpp") | Ok("llama.cpp") => Backend::LlamaCpp,
+            _ => Backend::Ollama,
+        };
+        Self::new(&endpoint, &model, backend)
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Cheap reachability check, so the console can say the model is offline
+    /// instead of surfacing a 500 when someone presses Generate.
+    pub async fn probe(&self) -> Result<()> {
+        let url = match self.backend {
+            Backend::Ollama => format!("{}/api/tags", self.endpoint),
+            Backend::LlamaCpp => format!("{}/health", self.endpoint),
+        };
+        // Three seconds was too tight: Ollama answers /api/tags in milliseconds
+        // when idle, but a request arriving while it is loading a model into
+        // memory would time out and the console would report the server as
+        // unreachable when it was merely busy.
+        let res = self
+            .client
+            .get(&url)
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| {
+                // "Unreachable" and "too slow to answer" need different fixes,
+                // so they get different messages.
+                if error.is_timeout() {
+                    anyhow::anyhow!(
+                        "the model server at {} did not respond within {}s; it may be loading a model",
+                        self.endpoint,
+                        PROBE_TIMEOUT.as_secs()
+                    )
+                } else {
+                    anyhow::anyhow!("no model server reachable at {}: {error}", self.endpoint)
+                }
+            })?;
+        if !res.status().is_success() {
+            bail!(
+                "model server at {} returned {}",
+                self.endpoint,
+                res.status()
+            );
+        }
+        Ok(())
+    }
+
+    /// Free-form multi-turn conversation.
+    ///
+    /// Uses the chat endpoint rather than raw completion so the model keeps
+    /// the thread of the conversation instead of answering each message cold.
+    pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+        match self.backend {
+            Backend::Ollama => {
+                let req = OllamaChatRequest {
+                    model: &self.model,
+                    messages,
+                    stream: false,
+                    options: OllamaOptions {
+                        // Higher than pack drafting: this is conversation, not
+                        // structured extraction, and 0.1 makes it wooden.
+                        temperature: 0.6,
+                        // Capped deliberately. A 1.5B model given a long budget
+                        // will pad rather than stop, and padding turns into
+                        // verbatim repetition.
+                        num_predict: 420,
+                        repeat_penalty: Some(1.18),
+                        repeat_last_n: Some(256),
+                        top_p: Some(0.9),
+                    },
+                };
+                let res = self
+                    .client
+                    .post(format!("{}/api/chat", self.endpoint))
+                    .json(&req)
+                    .timeout(std::time::Duration::from_secs(180))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("could not reach the model server at {}", self.endpoint)
+                    })?;
+                if !res.status().is_success() {
+                    bail!("model server returned {}", res.status());
+                }
+                let reply = res.json::<OllamaChatResponse>().await?.message.content;
+                Ok(trim_degenerate_repetition(&reply))
+            }
+            Backend::LlamaCpp => {
+                // llama.cpp's completion endpoint has no chat role handling, so
+                // flatten the thread into a transcript.
+                let transcript = messages
+                    .iter()
+                    .map(|m| format!("{}: {}", m.role, m.content))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    );
+                self.complete(format!(
+                    "{transcript}
+assistant:"
+                ))
+                .await
+            }
+        }
+    }
+
+    async fn complete(&self, prompt: String) -> Result<String> {
+        match self.backend {
+            Backend::Ollama => {
+                let req = OllamaRequest {
+                    model: &self.model,
+                    prompt,
+                    stream: false,
+                    format: "json",
+                    options: OllamaOptions {
+                        temperature: 0.1,
+                        num_predict: 700,
+                        repeat_penalty: Some(1.1),
+                        repeat_last_n: Some(64),
+                        top_p: None,
+                    },
+                };
+                let res = self
+                    .client
+                    .post(format!("{}/api/generate", self.endpoint))
+                    .json(&req)
+                    .timeout(std::time::Duration::from_secs(120))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("could not reach the model server at {}", self.endpoint)
+                    })?;
+                if !res.status().is_success() {
+                    bail!("model server returned {}", res.status());
+                }
+                Ok(res.json::<OllamaResponse>().await?.response)
+            }
+            Backend::LlamaCpp => {
+                let req = LlamaCppRequest {
+                    prompt,
+                    n_predict: 700,
+                    temperature: 0.1,
+                };
+                let res = self
+                    .client
+                    .post(format!("{}/completion", self.endpoint))
+                    .json(&req)
+                    .timeout(std::time::Duration::from_secs(120))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("could not reach the model server at {}", self.endpoint)
+                    })?;
+                if !res.status().is_success() {
+                    bail!("model server returned {}", res.status());
+                }
+                Ok(res.json::<LlamaCppResponse>().await?.content)
+            }
+        }
+    }
+
+    /// Draft a candidate pack for one dead-letter cluster.
+    ///
+    /// The result is a *candidate*. It is never activated here; the caller
+    /// scores it against the samples and a human approves it.
+    pub async fn draft_pack(&self, cluster_id: &str, samples: &[String]) -> Result<Pack> {
+        if samples.is_empty() {
+            bail!("cluster {cluster_id} has no samples to learn from");
+        }
+
+        let shown: Vec<&String> = samples.iter().take(5).collect();
+        // Extract the field names that genuinely exist in this format and give
+        // the model a closed list. Asked open-endedly, a 1.5B model answers
+        // with the *value* it saw ("10.2.4.7") rather than the name
+        // ("src_addr"); turning generation into selection removes that failure.
+        let available = available_field_names(samples);
+        let source_profile = crate::profile::analyze(samples);
+        let prompt = build_prompt(&shown, &available, &source_profile);
+        let raw = self.complete(prompt).await?;
+
+        let spec: DraftSpec = parse_json_object(&raw)
+            .with_context(|| format!("model did not return a usable JSON object: {raw:.400}"))?;
+
+        Ok(assemble_pack(
+            cluster_id,
+            spec,
+            samples,
+            &self.model,
+            &source_profile,
+        ))
+    }
+}
+
+fn build_prompt(
+    samples: &[&String],
+    available: &[String],
+    source_profile: &crate::profile::SourceProfile,
+) -> String {
+    // The log lines go LAST, and no filled-in example is shown. An earlier
+    // version put a complete FortiGate example in the prompt and a 1.5B model
+    // simply copied it back — emitting `devname=` and `srcip` for an Apache
+    // log. Describing the value types instead of demonstrating them removes
+    // anything worth copying.
+    format!(
+        "You analyse security log formats. Answer ONLY with a JSON object.
+
+         Keys and the value each must hold:
+         \"vendor\": the vendor that most likely produced these lines, else \"Unknown\"
+         \"product\": the product name, else \"Unknown\"
+         \"log_format\": a short hyphenated label describing the shape you see
+         \"fields\": object mapping an OCSF attribute to ONE name from the          AVAILABLE NAMES list. Use the name itself, never the value it holds.          Omit an attribute if no name fits. Allowed attributes: {fields}
+
+         Deterministic pre-analysis (evidence, not ground truth):
+         wire format: {wire_format} ({wire_confidence:.0}% confidence)
+         source family: {source_family} ({family_confidence:.0}% confidence)
+         Do not invent a vendor/product when the log does not name one. Rust code will          independently validate identity before a candidate is emitted.
+
+         AVAILABLE NAMES (choose only from these): {available}
+
+         LOG LINES:
+{lines}",
+        fields = ALLOWED_FIELDS.join(", "),
+        wire_format = source_profile.wire_format,
+        wire_confidence = source_profile.wire_format_confidence * 100.0,
+        source_family = source_profile.source_family,
+        family_confidence = source_profile.source_family_confidence * 100.0,
+        available = available.join(", "),
+        lines = samples
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("
+"),
+    )
+}
+
+/// Pull the first JSON object out of a model reply.
+///
+/// `format: "json"` makes Ollama emit bare JSON, but llama.cpp and chattier
+/// models still wrap it in prose or a code fence.
+fn parse_json_object(raw: &str) -> Result<DraftSpec> {
+    let text = raw.trim();
+    let start = text.find('{').context("no JSON object in reply")?;
+    let end = text.rfind('}').context("no closing brace in reply")?;
+    if end <= start {
+        bail!("malformed JSON object in reply");
+    }
+    Ok(serde_json::from_str(&text[start..=end])?)
+}
+
+/// Reject detector literals that would only ever match the sample they came
+/// from. This is the same failure that made an earlier drafter emit detectors
+/// containing a wall-clock time, which can never match future traffic.
+///
+/// Public because `ulpf draft` needs exactly this test and had none: its
+/// detectors were built from any token shared across a cluster, so a
+/// single-record cluster contributed its whole timestamped line and the
+/// resulting pack could never match a second event.
+pub fn is_stable_literal(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() < 3 || t.len() > 40 {
+        return false;
+    }
+    // Any run of digits long enough to be a time, date, port or address makes
+    // the literal volatile.
+    let longest_digit_run = t
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if longest_digit_run >= 3 {
+        return false;
+    }
+    // Clock- and date-shaped fragments.
+    if t.contains(':') && t.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // Month abbreviations and bare weekday names look stable inside one
+    // capture but rotate with the calendar, and a single hostname does not
+    // generalise past the box it came from. Require some structure -
+    // punctuation or a separator - which is what real format markers have.
+    const CALENDAR: &[&str] = &[
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec", "mon",
+        "tue", "wed", "thu", "fri", "sat", "sun",
+    ];
+    if CALENDAR.contains(&t.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    // Either the token carries format punctuation (`devname=`, `zephyrfw:`),
+    // or it is long enough to be a distinctive product string rather than a
+    // short host label: "MyAppClient" identifies a source, "gw01" identifies
+    // one box.
+    let has_structure = t.contains(|c: char| "=:[]/\"|_".contains(c));
+    (has_structure || t.len() >= 8) && t.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Decide the decoder chain from the shape of the samples.
+/// One step of an inferred decoder chain.
+///
+/// Carries the delimiter as well as the decoder name. Returning names alone
+/// meant a delimited format could only ever be read as comma-separated: the
+/// Loghub HealthApp corpus is pipe-delimited and Zeek's conn.log is
+/// tab-delimited, and both fell through to `keyvalue`, which finds no pairs in
+/// them and extracts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderStep {
+    pub decoder: &'static str,
+    pub delim: Option<char>,
+}
+
+impl DecoderStep {
+    fn plain(decoder: &'static str) -> Self {
+        Self {
+            decoder,
+            delim: None,
+        }
+    }
+}
+
+/// The delimiter a set of records is separated by, if they agree on one.
+///
+/// A real delimited format uses its separator the same number of times on
+/// nearly every line, because the column count is fixed. Prose containing a
+/// stray comma does not. Requiring agreement across samples is what separates
+/// the two, and it is why this looks at consistency rather than raw frequency.
+fn infer_delimiter(samples: &[String]) -> Option<char> {
+    const CANDIDATES: [char; 4] = ['|', '\t', ',', ';'];
+    let considered: Vec<&String> = samples.iter().take(20).collect();
+    if considered.len() < 2 {
+        return None;
+    }
+
+    let mut best: Option<(char, usize)> = None;
+    for delimiter in CANDIDATES {
+        let counts: Vec<usize> = considered
+            .iter()
+            .map(|line| line.matches(delimiter).count())
+            .collect();
+        let lowest = *counts.iter().min().unwrap_or(&0);
+        // At least three fields on every line, and no line disagreeing with the
+        // most common count by more than one - firmware revisions do append a
+        // column, so demanding exact agreement is too strict.
+        if lowest < 2 {
+            continue;
+        }
+        let highest = *counts.iter().max().unwrap_or(&0);
+        if highest - lowest > 1 {
+            continue;
+        }
+        if best.is_none_or(|(_, seen)| lowest > seen) {
+            best = Some((delimiter, lowest));
+        }
+    }
+    best.map(|(delimiter, _)| delimiter)
+}
+
+/// Decide the decoder chain from the shape of the samples.
+pub fn infer_decoders(samples: &[String]) -> Vec<DecoderStep> {
+    let joined = samples.join("\n");
+    let first = samples.first().map(String::as_str).unwrap_or("");
+
+    let mut chain = Vec::new();
+
+    // A syslog envelope wraps the body; strip it before reading the body.
+    let syslog_framed = first.starts_with('<')
+        || first
+            .split_whitespace()
+            .next()
+            .map(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "jan"
+                        | "feb"
+                        | "mar"
+                        | "apr"
+                        | "may"
+                        | "jun"
+                        | "jul"
+                        | "aug"
+                        | "sep"
+                        | "oct"
+                        | "nov"
+                        | "dec"
+                )
+            })
+            .unwrap_or(false);
+    if syslog_framed {
+        chain.push(DecoderStep::plain("syslog"));
+    }
+
+    if joined.contains("CEF:") {
+        chain.push(DecoderStep::plain("cef"));
+    } else if joined.contains("LEEF:") {
+        chain.push(DecoderStep::plain("leef"));
+    } else if first.trim_start().starts_with('{') {
+        chain.push(DecoderStep::plain("json"));
+    } else if first.trim_start().starts_with('<') && first.contains("</") {
+        chain.push(DecoderStep::plain("xml"));
+    } else if count_kv_pairs(&joined) >= 2 {
+        chain.push(DecoderStep::plain("keyvalue"));
+    } else if let Some(delimiter) = infer_delimiter(samples) {
+        // Positional columns. The CSV decoder emits `col.N` for every field, so
+        // even a layout nobody has documented produces an inspectable map.
+        chain.push(DecoderStep {
+            decoder: "csv",
+            delim: Some(delimiter),
+        });
+    }
+
+    if chain.is_empty() {
+        chain.push(DecoderStep::plain("keyvalue"));
+    }
+    chain
+}
+
+/// Count `key=value` pairs, ignoring `=` inside quotes.
+fn count_kv_pairs(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|t| {
+            t.split_once('=')
+                .map(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn assemble_pack(
+    cluster_id: &str,
+    spec: DraftSpec,
+    samples: &[String],
+    model: &str,
+    source_profile: &crate::profile::SourceProfile,
+) -> Pack {
+    // Detectors are derived from the samples themselves rather than taken on
+    // the model's word. A literal that does not occur in every sample cannot
+    // identify the source, and a model that hallucinates one would produce a
+    // pack that silently matches nothing.
+    let derived = derive_detector_for(samples);
+    let detect = derived.literals.clone();
+    // Fixtures come from what the detector claims, not from the cluster. A
+    // fixture the pack cannot claim fails by construction and blocks approval
+    // on a draft that is otherwise correct for its own format.
+    let fixture_pool: &[String] = if derived.claimed.is_empty() {
+        samples
+    } else {
+        &derived.claimed
+    };
+
+    // Which decoders a body needs is decided by looking at the bytes, not by
+    // asking the model. A 1.5B model offered "cef" for a plain key=value body;
+    // the shape of the text answers this question exactly.
+    let decoders: Vec<ExtractStep> = infer_decoders(samples)
+        .into_iter()
+        .map(|d| ExtractStep {
+            decoder: d.decoder.to_string(),
+            sep: None,
+            delim: d.delim,
+            headers: Vec::new(),
+            patterns: Vec::new(),
+            // A drafted chain is a guess; a step that does not fit should not
+            // sink the record.
+            optional: true,
+        })
+        .collect();
+
+    let mut map: BTreeMap<String, MapSpec> = BTreeMap::new();
+    // The category can suggest a class, but not a class-specific action. The
+    // operator must map GET/deny/logoff/etc. explicitly during review.
+    map.insert("activity_id".into(), MapSpec::Literal(serde_json::json!(0)));
+    map.insert("severity_id".into(), MapSpec::Literal(serde_json::json!(1)));
+    // Convention-based mapping first: it is deterministic and correct far more
+    // often than a small model's guess.
+    let available = available_field_names(samples);
+    for (ocsf_path, source) in infer_field_map(&available) {
+        let cast = if ocsf_path.ends_with(".port") {
+            Some(ulpf_pack::spec::Cast::Int)
+        } else {
+            None
+        };
+        map.insert(
+            ocsf_path,
+            MapSpec::Field(ulpf_pack::spec::FieldSpec {
+                from: ulpf_pack::spec::OneOrMany::One(source),
+                cast,
+                format: None,
+                enum_table: None,
+                default: None,
+                observable: None,
+            }),
+        );
+    }
+
+    // Anything the model suggested that convention missed, if it survives
+    // validation, fills the remaining gaps.
+    for (ocsf_path, source) in spec.fields {
+        if !ALLOWED_FIELDS.contains(&ocsf_path.as_str())
+            || source.trim().is_empty()
+            || map.contains_key(&ocsf_path)
+        {
+            continue;
+        }
+        // A positional format such as an Apache access line has no named
+        // fields, and a small model asked for one tends to answer with the
+        // *value* it saw ("192.168.1.100") instead. Emitting that as a source
+        // field name would produce a pack that silently maps nothing, so only
+        // names that actually occur as keys in the samples are kept.
+        if !looks_like_a_field_name(&source, samples) {
+            continue;
+        }
+        map.insert(
+            ocsf_path,
+            MapSpec::Field(ulpf_pack::spec::FieldSpec {
+                from: ulpf_pack::spec::OneOrMany::One(source),
+                cast: None,
+                format: None,
+                enum_table: None,
+                default: None,
+                observable: None,
+            }),
+        );
+    }
+
+    // The class is decided last, once every mapped attribute is known: a
+    // suggested class is only usable if it declares all of them. The model's
+    // extra fields land above, so deciding earlier would judge a map that was
+    // still being built.
+    let suggested = (source_profile.source_family_confidence >= 0.60)
+        .then_some(source_profile.suggested_class_uid)
+        .flatten();
+    let provisional_class =
+        crate::ocsf_paths::provisional_class(suggested, map.keys().map(String::as_str));
+    if let Some(uid) = suggested {
+        if uid != provisional_class {
+            tracing::debug!(
+                suggested_class_uid = uid,
+                used_class_uid = provisional_class,
+                "suggested class does not declare every mapped attribute; keeping Network Activity"
+            );
+        }
+    }
+    map.insert(
+        "class_uid".into(),
+        MapSpec::Literal(serde_json::json!(provisional_class)),
+    );
+
+    // Fixtures come from the real samples, so the scorer grades the candidate
+    // against the traffic it was drafted from.
+    let fixtures: Vec<Fixture> = crate::sampler::diverse_samples(fixture_pool, 3)
+        .into_iter()
+        .map(|raw| Fixture {
+            raw,
+            expect: BTreeMap::new(),
+            note: Some("Representative sample; confirm mappings before approval.".into()),
+        })
+        .collect();
+
+    // A small model's vendor name is never sufficient evidence by itself.
+    // Retain an exact identity only when the deterministic profiler found a
+    // distinctive signature; otherwise keep Unknown even if the model guessed.
+    let identified = source_profile
+        .source_hypotheses
+        .first()
+        .filter(|h| h.confidence >= 0.90);
+    if let Some(identity) = identified {
+        if !spec.vendor.eq_ignore_ascii_case(&identity.vendor)
+            || !spec.product.eq_ignore_ascii_case(&identity.product)
+        {
+            tracing::warn!(
+                model_vendor = %spec.vendor,
+                model_product = %spec.product,
+                evidence_vendor = %identity.vendor,
+                evidence_product = %identity.product,
+                "model identity did not agree with deterministic source evidence"
+            );
+        }
+    }
+    if !spec.log_format.trim().is_empty()
+        && !spec
+            .log_format
+            .eq_ignore_ascii_case(&source_profile.wire_format)
+    {
+        tracing::debug!(
+            model_format = %spec.log_format,
+            observed_format = %source_profile.wire_format,
+            "using syntax-derived wire format instead of model label"
+        );
+    }
+    let (vendor, product) = identified
+        .map(|h| (h.vendor.clone(), h.product.clone()))
+        .unwrap_or_else(|| ("Unknown".into(), "Unknown".into()));
+
+    Pack {
+        identity: Identity {
+            id: format!("candidate-{cluster_id}"),
+            vendor,
+            product,
+            version: None,
+            log_format: Some(source_profile.wire_format.clone()),
+            detect: vec![Detector {
+                contains_all: detect,
+                contains_any: Vec::new(),
+                contains_none: Vec::new(),
+                starts_with: None,
+                syslog_tag: false,
+                loghub_syslog_prefix: false,
+            }],
+            // Well below every hand-written pack, so a candidate can never
+            // shadow a reviewed one.
+            priority: 1000,
+        },
+        extract: if decoders.is_empty() {
+            vec![ExtractStep {
+                decoder: "keyvalue".into(),
+                sep: None,
+                delim: None,
+                headers: Vec::new(),
+                patterns: Vec::new(),
+                optional: true,
+            }]
+        } else {
+            decoders
+        },
+        map,
+        enums: BTreeMap::new(),
+        fixtures,
+        provenance: Some(Provenance {
+            author: Some("generated".into()),
+            created: Some(ulpf_core::now_nanos().to_string()),
+            cluster_id: Some(cluster_id.to_string()),
+            approved_by: None,
+            model: Some(model.to_string()),
+        }),
+    }
+}
+
+/// Map source field names onto OCSF attributes by naming convention.
+///
+/// Device vendors are remarkably consistent here: a source address is
+/// `srcip`, `src_addr`, `src`, `source_ip` or `saddr`, essentially never
+/// anything else. Matching those patterns is deterministic and, unlike a small
+/// model, cannot answer with the field's *value*.
+///
+/// `qwen2.5:1.5b-instruct` returned values rather than names even when handed
+/// an explicit list of the available names, so this carries the mapping and
+/// the model is used only for naming the vendor and format.
+pub fn infer_field_map(available: &[String]) -> BTreeMap<String, String> {
+    // Ordered: the first available name matching any pattern wins, so more
+    // specific spellings are listed before looser ones.
+    const RULES: &[(&str, &[&str])] = &[
+        (
+            "src_endpoint.port",
+            &[
+                "srcport",
+                "src_port",
+                "src_prt",
+                "sport",
+                "spt",
+                "sourceport",
+            ],
+        ),
+        (
+            "dst_endpoint.port",
+            &[
+                "dstport",
+                "dst_port",
+                "dst_prt",
+                "dport",
+                "dpt",
+                "destport",
+                "destinationport",
+            ],
+        ),
+        (
+            "src_endpoint.ip",
+            &[
+                "srcip",
+                "src_ip",
+                "src_addr",
+                "saddr",
+                "sourceip",
+                "source_ip",
+                "src",
+            ],
+        ),
+        (
+            "dst_endpoint.ip",
+            &[
+                "dstip",
+                "dst_ip",
+                "dst_addr",
+                "daddr",
+                "destip",
+                "destination_ip",
+                "dst",
+            ],
+        ),
+        (
+            "connection_info.protocol_name",
+            &["proto", "protocol", "ipproto", "transport"],
+        ),
+        (
+            "device.hostname",
+            &["devname", "hostname", "host", "device", "dvchost", "devid"],
+        ),
+        (
+            "actor.user.name",
+            &["user", "username", "usr", "suser", "srcuser", "account"],
+        ),
+        (
+            "url.url_string",
+            &["url", "request", "uri", "requesturl", "cs_uri"],
+        ),
+        (
+            "message",
+            &["msg", "message", "evt", "event", "reason", "description"],
+        ),
+    ];
+
+    let normalise = |s: &str| {
+        s.to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+    };
+
+    let mut out = BTreeMap::new();
+    let mut used: Vec<String> = Vec::new();
+
+    for (ocsf_path, patterns) in RULES {
+        for pattern in *patterns {
+            let target = normalise(pattern);
+            if let Some(found) = available
+                .iter()
+                .find(|name| normalise(name) == target && !used.contains(name))
+            {
+                out.insert(ocsf_path.to_string(), found.clone());
+                used.push(found.clone());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Field names that actually occur in the samples.
+///
+/// Handles the two shapes that carry names — `key=value` bodies and JSON
+/// objects — and falls back to positional `col.N` for delimited records.
+pub fn available_field_names(samples: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+
+    for sample in samples.iter().take(5) {
+        // key=value
+        for token in sample.split_whitespace() {
+            if let Some((key, _)) = token.split_once('=') {
+                if !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                    && !names.iter().any(|n| n == key)
+                {
+                    names.push(key.to_string());
+                }
+            }
+        }
+        // JSON keys
+        if sample.trim_start().starts_with('{') {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(sample)
+            {
+                for key in map.keys() {
+                    if !names.iter().any(|n| n == key) {
+                        names.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Positional fallback for delimited records with no names at all.
+    if names.is_empty() {
+        if let Some(first) = samples.first() {
+            let columns = first.matches(',').count() + 1;
+            if columns >= 3 {
+                names.extend((0..columns.min(40)).map(|i| format!("col.{i}")));
+            }
+        }
+    }
+
+    names.truncate(60);
+    names
+}
+
+/// Whether `candidate` plausibly names a field the decoders will produce.
+///
+/// Accepts `col.N` (positional CSV), and any token that appears in the samples
+/// immediately followed by `=` or `":` — i.e. it is used as a key there, not
+/// as a value.
+fn looks_like_a_field_name(candidate: &str, samples: &[String]) -> bool {
+    let name = candidate.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("unknown") || name.contains(' ') {
+        return false;
+    }
+    if name.starts_with("col.") {
+        return true;
+    }
+    let as_kv = format!("{name}=");
+    let as_json = format!("\"{name}\"");
+    samples
+        .iter()
+        .any(|s| s.contains(&as_kv) || s.contains(&as_json))
+}
+
+/// Derive detector literals from the samples themselves.
+///
+/// Takes the whitespace-separated tokens that appear, unchanged, in *every*
+/// sample in the cluster — which is exactly what Drain's template already
+/// tells us is the fixed part of the shape. Volatile tokens are excluded by
+/// [`is_stable_literal`], so timestamps and addresses can never end up in a
+/// detector.
+/// Whether a token before `=` looks like a field name rather than prose.
+fn is_field_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 40
+        && key.chars().any(|c| c.is_ascii_alphabetic())
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Propose a pack id from what the samples actually say about the device.
+///
+/// `draft-heuristic` was a placeholder, and a bad one: every unedited draft
+/// approved to the same filename, so onboarding a second unknown device
+/// silently overwrote the pack drafted for the first.
+///
+/// The replacement is evidence-based. A device tag sits early in the line in
+/// essentially every syslog-shaped format — `apx-ngfw`, `sshd`, `kernel` — so
+/// the first token that is a stable literal across *all* samples is the best
+/// available guess at what to call this source. Position matters and the
+/// detector list cannot supply it: `derive_detectors` sorts by class and
+/// length, which would name a firewall after its busiest message type rather
+/// than after the firewall.
+///
+/// This is a suggestion, not an identification. The operator is expected to
+/// correct it in the review pane before approving, and the vendor/product
+/// fields stay `Unknown` unless a signature genuinely supports one.
+pub fn suggest_pack_id(samples: &[String], wire_format: &str, cluster_id: &str) -> String {
+    let first = samples.first().map(String::as_str).unwrap_or_default();
+
+    let base = first
+        .split_whitespace()
+        .find(|token| {
+            // A `key=value` pair names a field, never the device.
+            if let Some((key, _)) = token.split_once('=') {
+                if is_field_key(key) {
+                    return false;
+                }
+            }
+            let cleaned = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            is_stable_literal(cleaned) && samples.iter().all(|sample| sample.contains(cleaned))
+        })
+        .map(slug)
+        .filter(|s| !s.is_empty());
+
+    match base {
+        Some(name) => format!("{name}-{}", slug(wire_format)),
+        // Nothing stable to name it after. Fall back to the cluster, which is
+        // at least unique, rather than to a constant that collides.
+        None => format!("unknown-{}-{}", slug(wire_format), slug(cluster_id)),
+    }
+}
+
+/// Reduce a token to a safe, readable filename stem.
+fn slug(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+/// A detector for a cluster, and the samples it actually claims.
+///
+/// The two travel together because a generated pack's fixtures are drawn from
+/// its samples, and a fixture the detector does not claim fails by
+/// construction. That is what produced "0/3 fixtures pass — pack does not
+/// claim its own fixture" on a draft nobody could approve.
+pub struct DerivedDetector {
+    pub literals: Vec<String>,
+    /// The samples `literals` match. Empty only when nothing was derivable.
+    pub claimed: Vec<String>,
+}
+
+/// Work out what identifies a cluster, in falling order of confidence.
+///
+/// Clusters are not always one source. A drain template can merge records that
+/// share a shape but not an origin, and the case that exposed this held two
+/// Linux root logins and one malformed Apache request. Nothing is common to
+/// all three, because they are not the same thing.
+///
+/// So: a token every sample carries, else a phrase every sample carries, else
+/// the strongest literal a majority carry -- drafting for the dominant format
+/// and reporting the rest as unclaimed, which is more useful than refusing to
+/// draft at all. Only when even a majority share nothing does the placeholder
+/// appear.
+pub fn derive_detector_for(samples: &[String]) -> DerivedDetector {
+    let all = |literals: Vec<String>| DerivedDetector {
+        literals,
+        claimed: samples.to_vec(),
+    };
+
+    let tokens = derive_detectors(samples);
+    if !tokens.is_empty() {
+        return all(tokens);
+    }
+    if let Some(phrase) = longest_common_phrase(samples) {
+        return all(vec![phrase]);
+    }
+
+    // Candidates come from pairs, not from single samples. A lone sample
+    // yields nothing here: is_stable_literal wants punctuation or eight
+    // characters, so `combo`, `ROOT` and `LOGIN` are each rejected on their
+    // own even though `ROOT LOGIN ON` identifies the source exactly. Two
+    // samples that agree, on the other hand, produce a phrase directly.
+    //
+    // Bounded at eight samples because this is quadratic in the pair count and
+    // a cluster's shape is settled long before the ninth record.
+    const PAIR_LIMIT: usize = 8;
+    let head = &samples[..samples.len().min(PAIR_LIMIT)];
+    let mut best: Option<(usize, String)> = None;
+    for (i, a) in head.iter().enumerate() {
+        for b in head.iter().skip(i + 1) {
+            let Some(candidate) = longest_common_phrase(&[a.clone(), b.clone()]) else {
+                continue;
+            };
+            let hits = samples.iter().filter(|s| s.contains(&candidate)).count();
+            let better = best
+                .as_ref()
+                .is_none_or(|(n, l)| hits > *n || (hits == *n && candidate.len() > l.len()));
+            if better {
+                best = Some((hits, candidate));
+            }
+        }
+    }
+
+    // A strict majority, and never a single sample: one record agreeing with
+    // itself is not evidence of a format.
+    if let Some((hits, literal)) = best {
+        if hits >= 2 && hits * 2 > samples.len() {
+            let claimed: Vec<String> = samples
+                .iter()
+                .filter(|s| s.contains(&literal))
+                .cloned()
+                .collect();
+            // Within the agreeing subset a phrase may be available even though
+            // it was not across the whole cluster, and it identifies the source
+            // more tightly than the single token that found the subset.
+            let literals = match longest_common_phrase(&claimed) {
+                Some(phrase) if phrase.len() > literal.len() => vec![phrase],
+                _ => vec![literal],
+            };
+            let claimed = claimed
+                .into_iter()
+                .filter(|s| literals.iter().all(|l| s.contains(l)))
+                .collect();
+            return DerivedDetector { literals, claimed };
+        }
+    }
+
+    DerivedDetector {
+        literals: vec![DETECTOR_PLACEHOLDER.to_string()],
+        claimed: Vec::new(),
+    }
+}
+
+/// Stands in for a detector the generator could not derive. It is deliberately
+/// text no log line will contain, so a draft carrying it loads without claiming
+/// traffic, and deliberately readable, so the operator editing the draft can
+/// see what is being asked of them.
+pub const DETECTOR_PLACEHOLDER: &str = "REPLACE-WITH-A-LITERAL-UNIQUE-TO-THIS-SOURCE";
+
+/// The longest run of consecutive whitespace-separated tokens that every
+/// sample contains, when no single token was stable enough on its own.
+///
+/// `derive_detectors` judges tokens one at a time, so a source whose only
+/// fixed text is a phrase gets nothing from it. `Jun 15 04:06:18 combo --
+/// ROOT LOGIN ON tty1` is the case that exposed this: `ROOT`, `LOGIN` and
+/// `ON` are each too short or too common to be a stable literal, while
+/// `ROOT LOGIN ON` identifies the source exactly. Returning that phrase turns
+/// a draft that could not compile into one an operator can review.
+pub fn longest_common_phrase(samples: &[String]) -> Option<String> {
+    let first = samples.first()?;
+    let tokens: Vec<&str> = first.split_whitespace().collect();
+    let mut best: Option<String> = None;
+
+    for start in 0..tokens.len() {
+        // Extend while every sample still contains the phrase; the first
+        // failure ends this start position, because a longer phrase from it
+        // can only be rarer.
+        let mut end = start + 1;
+        while end <= tokens.len() {
+            let phrase = tokens[start..end].join(" ");
+            if !samples.iter().all(|sample| sample.contains(&phrase)) {
+                break;
+            }
+            // A phrase carrying a long digit run is a timestamp or an address
+            // wearing a phrase's clothes, and will not hold across records.
+            let volatile = phrase
+                .split(|c: char| !c.is_ascii_digit())
+                .map(str::len)
+                .max()
+                .unwrap_or(0)
+                >= 3;
+            let words = end - start;
+            if !volatile
+                && words >= 2
+                && phrase.len() >= 6
+                && phrase.chars().any(|c| c.is_ascii_alphabetic())
+                && best.as_ref().is_none_or(|b| phrase.len() > b.len())
+            {
+                best = Some(phrase);
+            }
+            end += 1;
+        }
+    }
+    best
+}
+
+/// Derive the `contains_all` literals that will claim this source.
+///
+/// Two rules, both learned from drafts that scored well and then matched
+/// nothing in production:
+///
+/// * **A `key=value` token contributes its key, never its value.** With five
+///   samples from one device, a constant `dst_addr=8.8.4.4` looks as shared as
+///   `dst_addr=` does — but a detector built on the value claims only traffic
+///   to that one address. The field *name* is what identifies the format; the
+///   value is an accident of the sample set.
+/// * **A program or vendor tag outranks a field name.** `acmefw:` identifies a
+///   device; `src=` is carried by half of all key-value logs ever written. An
+///   earlier version ranked purely by length, which put a destination address
+///   first and dropped the vendor tag off the end of the list.
+pub fn derive_detectors(samples: &[String]) -> Vec<String> {
+    let Some(first) = samples.first() else {
+        return Vec::new();
+    };
+
+    let mut shared: Vec<String> = Vec::new();
+    for token in first.split_whitespace() {
+        match token.split_once('=') {
+            Some((key, _)) if is_field_key(key) => shared.push(format!("{key}=")),
+            // Not a pair, so the token itself has to carry the identity.
+            _ if is_stable_literal(token) => shared.push(token.to_string()),
+            _ => {}
+        }
+    }
+
+    for sample in samples.iter().skip(1) {
+        shared.retain(|token| sample.contains(token.as_str()));
+    }
+
+    shared.sort();
+    shared.dedup();
+    shared.sort_by(|a, b| {
+        // Class 0 is a tag or literal marker, class 1 a bare field name.
+        let class = |t: &String| usize::from(t.ends_with('='));
+        class(a)
+            .cmp(&class(b))
+            .then_with(|| b.len().cmp(&a.len()))
+            .then_with(|| a.cmp(b))
+    });
+    shared.truncate(3);
+    shared
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_looping_reply_is_cut_at_the_repeat() {
+        // The exact failure seen in the console: one sentence, many times.
+        let looped = "Here is the answer.
+"
+        .to_string()
+            + &"The logs are in a format that is easy to understand and read.
+"
+            .repeat(40);
+        let out = trim_degenerate_repetition(&looped);
+        let occurrences = out.matches("easy to understand").count();
+        assert!(
+            occurrences <= 2,
+            "still repeating {occurrences} times: {out}"
+        );
+        assert!(out.starts_with("Here is the answer."));
+    }
+
+    #[test]
+    fn a_normal_reply_is_left_alone() {
+        let normal = "You have 11 packs loaded.
+Coverage is 98%.
+Four records are unparsed.";
+        assert_eq!(trim_degenerate_repetition(normal), normal);
+    }
+
+    #[test]
+    fn repetition_inside_one_paragraph_is_also_cut() {
+        let looped = "Fine. ".to_string()
+            + &"The logs are in a format that is easy to understand and read. ".repeat(30);
+        let out = trim_degenerate_repetition(&looped);
+        assert!(
+            out.len() < looped.len() / 3,
+            "not trimmed: {} chars",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn volatile_detector_literals_are_rejected() {
+        // These are what made an earlier drafter emit unusable detectors.
+        assert!(!is_stable_literal("12:11:24"));
+        assert!(!is_stable_literal("192.168.1.10"));
+        assert!(!is_stable_literal("2024-03-15"));
+        assert!(!is_stable_literal("1045"));
+        assert!(!is_stable_literal("UserID: 1045"));
+    }
+
+    #[test]
+    fn stable_detector_literals_are_kept() {
+        assert!(is_stable_literal("devname="));
+        assert!(is_stable_literal("type=traffic"));
+        assert!(is_stable_literal("[AppServer]"));
+        assert!(is_stable_literal("MyAppClient"));
+    }
+
+    #[test]
+    fn field_names_map_onto_ocsf_by_convention() {
+        // The exact names from the unknown appliance in testing.
+        let available: Vec<String> = [
+            "evt", "src_addr", "src_prt", "dst_addr", "dst_prt", "proto", "verdict", "rule",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let m = infer_field_map(&available);
+        assert_eq!(
+            m.get("src_endpoint.ip").map(String::as_str),
+            Some("src_addr")
+        );
+        assert_eq!(
+            m.get("src_endpoint.port").map(String::as_str),
+            Some("src_prt")
+        );
+        assert_eq!(
+            m.get("dst_endpoint.ip").map(String::as_str),
+            Some("dst_addr")
+        );
+        assert_eq!(
+            m.get("dst_endpoint.port").map(String::as_str),
+            Some("dst_prt")
+        );
+        assert_eq!(
+            m.get("connection_info.protocol_name").map(String::as_str),
+            Some("proto")
+        );
+
+        // FortiGate spellings resolve too.
+        let fg: Vec<String> = ["srcip", "srcport", "dstip", "dstport", "devname", "action"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let m2 = infer_field_map(&fg);
+        assert_eq!(m2.get("src_endpoint.ip").map(String::as_str), Some("srcip"));
+        assert_eq!(
+            m2.get("device.hostname").map(String::as_str),
+            Some("devname")
+        );
+    }
+
+    #[test]
+    fn a_source_name_is_never_reused_for_two_attributes() {
+        let available: Vec<String> = ["src", "dst"].iter().map(|s| s.to_string()).collect();
+        let m = infer_field_map(&available);
+        let sources: Vec<&String> = m.values().collect();
+        let mut uniq = sources.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(sources.len(), uniq.len(), "a field was mapped twice: {m:?}");
+    }
+
+    #[test]
+    fn decoder_chain_is_inferred_from_the_bytes() {
+        let names = |s: &[String]| -> Vec<&'static str> {
+            infer_decoders(s).into_iter().map(|d| d.decoder).collect()
+        };
+
+        let kv = vec!["Mar 15 10:30:01 gw01 fw: src_addr=10.0.0.1 dst_addr=8.8.8.8".to_string()];
+        assert_eq!(names(&kv), vec!["syslog", "keyvalue"]);
+
+        let cef = vec!["CEF:0|V|P|1|1|name|5|src=10.0.0.1".to_string()];
+        assert_eq!(names(&cef), vec!["cef"]);
+
+        let js = vec![r#"{"src_ip":"10.0.0.1"}"#.to_string()];
+        assert_eq!(names(&js), vec!["json"]);
+
+        let csv = vec!["a,b,c,d,e,f,g,h".to_string(), "i,j,k,l,m,n,o,p".to_string()];
+        assert_eq!(names(&csv), vec!["csv"]);
+    }
+
+    #[test]
+    fn a_pipe_delimited_body_is_read_as_columns_not_as_pairs() {
+        // Real Loghub HealthApp lines. These carry no `=` pairs at all, so
+        // before delimiter inference they fell through to `keyvalue`, which
+        // extracted nothing from them.
+        let samples = vec![
+            "20171223-22:15:29:606|Step_LSC|30002312|onStandStepChanged 3579".to_string(),
+            "20171223-22:15:29:615|Step_LSC|30002312|onExtend:1514038530000 14 0 4".to_string(),
+            "20171223-22:15:29:653|Step_SPUtils|30002312|getTodayTotalDetailSteps".to_string(),
+        ];
+        let chain = infer_decoders(&samples);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].decoder, "csv");
+        assert_eq!(chain[0].delim, Some('|'));
+    }
+
+    #[test]
+    fn a_tab_delimited_body_is_recognised_too() {
+        let samples = vec![
+            "1331901000.0\tCwjj\t192.168.1.50\t49180\ttcp".to_string(),
+            "1331901005.1\tCXWv\t10.0.0.9\t51000\ttcp".to_string(),
+        ];
+        let chain = infer_decoders(&samples);
+        assert_eq!(chain[0].decoder, "csv");
+        assert_eq!(chain[0].delim, Some('\t'));
+    }
+
+    #[test]
+    fn prose_with_a_stray_comma_is_not_a_delimited_format() {
+        // Consistency, not frequency: a delimited format uses its separator the
+        // same number of times on every line because the column count is fixed.
+        let samples = vec![
+            "the component, which was idle, restarted".to_string(),
+            "restarted cleanly".to_string(),
+            "another message entirely, with one comma".to_string(),
+        ];
+        assert_ne!(infer_decoders(&samples)[0].decoder, "csv");
+    }
+
+    #[test]
+    fn calendar_words_and_bare_hostnames_are_weak_detectors() {
+        // Stable within one capture, but "Mar" fails in April and "gw01"
+        // fails on the next appliance.
+        assert!(!is_stable_literal("Mar"));
+        assert!(!is_stable_literal("gw01"));
+        // A real format marker has structure.
+        assert!(is_stable_literal("zephyrfw:"));
+        assert!(is_stable_literal("devname="));
+    }
+
+    #[test]
+    fn values_are_not_accepted_as_field_names() {
+        // What a small model actually returns for a positional format.
+        let apache = vec![
+            r#"192.168.1.100 - - [15/Mar/2024:10:30:01 +0000] "GET /a HTTP/1.1" 200 1024"#
+                .to_string(),
+        ];
+        assert!(!looks_like_a_field_name("192.168.1.100", &apache));
+        assert!(!looks_like_a_field_name("/api/v1/users", &apache));
+        assert!(!looks_like_a_field_name("Unknown", &apache));
+        assert!(!looks_like_a_field_name("GET /a HTTP/1.1", &apache));
+    }
+
+    #[test]
+    fn real_field_names_are_accepted() {
+        let kv = vec!["devname=\"FGT\" srcip=10.0.0.1 action=accept".to_string()];
+        assert!(looks_like_a_field_name("srcip", &kv));
+        assert!(looks_like_a_field_name("action", &kv));
+
+        let js = vec![r#"{"src_ip":"10.0.0.1","action":"allow"}"#.to_string()];
+        assert!(looks_like_a_field_name("src_ip", &js));
+
+        // Positional columns are always legitimate.
+        assert!(looks_like_a_field_name("col.7", &kv));
+    }
+
+    #[test]
+    fn detectors_come_from_tokens_shared_by_every_sample() {
+        // Real Apache lines: the shared, non-volatile tokens are the format
+        // markers, never the addresses or timestamps.
+        let samples = vec![
+            r#"192.168.1.100 - - [15/Mar/2024:10:30:01 +0000] "GET /a HTTP/1.1" 200 1024 "-" "MyAppClient/1.0""#.to_string(),
+            r#"10.2.4.19 - - [15/Mar/2024:10:31:44 +0000] "POST /b HTTP/1.1" 401 512 "-" "MyAppClient/1.0""#.to_string(),
+        ];
+        let detect = derive_detectors(&samples);
+        assert!(!detect.is_empty(), "expected at least one detector");
+        for d in &detect {
+            assert!(
+                samples.iter().all(|s| s.contains(d.as_str())),
+                "`{d}` is not present in every sample"
+            );
+            assert!(!d.contains("192.168"), "address leaked into detector: {d}");
+            assert!(!d.contains("10:30"), "timestamp leaked into detector: {d}");
+        }
+    }
+
+    #[test]
+    fn a_constant_value_never_becomes_the_detector() {
+        // Eight lines from one device all happen to talk to 8.8.4.4. Keying on
+        // that claims only traffic to that address; keying on `dst_addr=` and
+        // the program tag claims the device.
+        let samples: Vec<String> = (1..=8)
+            .map(|i| {
+                format!(
+                    "Sep  3 10:00:0{i} fw01 acmefw: action=allow src_addr=10.1.2.{i}                      dst_addr=8.8.4.4 src_port=4000{i} dst_port=443 proto=tcp"
+                )
+            })
+            .collect();
+
+        let detect = derive_detectors(&samples);
+        assert!(
+            !detect.iter().any(|d| d.contains("8.8.4.4")),
+            "a constant value leaked into the detector: {detect:?}"
+        );
+        assert!(
+            detect.iter().any(|d| d == "acmefw:"),
+            "the program tag is the strongest signal and must rank first: {detect:?}"
+        );
+        assert_eq!(detect[0], "acmefw:", "tags outrank bare field names");
+        for d in &detect {
+            assert!(
+                samples.iter().all(|s| s.contains(d.as_str())),
+                "`{d}` is not present in every sample"
+            );
+        }
+    }
+
+    #[test]
+    fn json_is_extracted_from_a_fenced_reply() {
+        let reply = "Here you go:
+```json
+{\"vendor\":\"Acme\",\"product\":\"Gateway\"}
+```";
+        let spec = parse_json_object(reply).unwrap();
+        assert_eq!(spec.vendor, "Acme");
+        assert_eq!(spec.product, "Gateway");
+    }
+
+    #[test]
+    fn a_reply_with_no_json_is_an_error_not_a_fabricated_pack() {
+        assert!(parse_json_object("I could not determine the format.").is_err());
+    }
+
+    #[test]
+    fn assembled_pack_is_low_priority_and_marked_generated() {
+        let spec = DraftSpec {
+            vendor: "Acme".into(),
+            product: "Gateway".into(),
+            log_format: "syslog-keyvalue".into(),
+            fields: BTreeMap::from([
+                ("src_endpoint.ip".into(), "srcip".into()),
+                ("not_a_real_field".into(), "x".into()),
+            ]),
+        };
+        let samples = vec![
+            "acme_fw srcip=10.0.0.1 action=accept".to_string(),
+            "acme_fw srcip=10.0.0.2 action=deny".to_string(),
+        ];
+        let source_profile = crate::profile::analyze(&samples);
+        let pack = assemble_pack("abc", spec, &samples, "test-model", &source_profile);
+
+        // Never shadows a reviewed pack.
+        assert_eq!(pack.identity.priority, 1000);
+        // Detectors are derived from tokens common to every sample, so the
+        // shared marker survives and the per-line values do not.
+        let detect = &pack.identity.detect[0].contains_all;
+        assert!(detect.contains(&"acme_fw".to_string()), "got {detect:?}");
+        assert!(
+            !detect.iter().any(|d| d.contains("10.0.0.1")),
+            "got {detect:?}"
+        );
+        // Decoders are inferred from the samples, not taken from the model:
+        // an unframed key=value body needs exactly the keyvalue decoder.
+        let chain: Vec<&str> = pack.extract.iter().map(|e| e.decoder.as_str()).collect();
+        assert_eq!(chain, vec!["keyvalue"]);
+        // Unknown OCSF paths are filtered out; the real one survives.
+        assert!(pack.map.contains_key("src_endpoint.ip"));
+        assert!(!pack.map.contains_key("not_a_real_field"));
+        // Provenance records that a human has not signed off.
+        let prov = pack.provenance.unwrap();
+        assert_eq!(prov.author.as_deref(), Some("generated"));
+        assert!(prov.approved_by.is_none());
+    }
+}
+
+#[cfg(test)]
+mod detector_fallback_tests {
+    use super::*;
+
+    /// The line from the console that produced an uncompilable draft: no token
+    /// is a stable literal on its own, so `derive_detectors` returns nothing.
+    fn root_login_samples() -> Vec<String> {
+        vec![
+            "Jun 15 04:06:18 combo -- ROOT LOGIN ON tty1".to_string(),
+            "Jun 16 11:22:07 combo -- ROOT LOGIN ON tty2".to_string(),
+            "Jul 02 09:14:55 combo -- ROOT LOGIN ON tty1".to_string(),
+        ]
+    }
+
+    #[test]
+    fn phrase_rescues_a_cluster_with_no_stable_token() {
+        let phrase =
+            longest_common_phrase(&root_login_samples()).expect("the samples share a phrase");
+        assert!(phrase.contains("ROOT LOGIN ON"), "got {phrase:?}");
+        for sample in root_login_samples() {
+            assert!(sample.contains(&phrase));
+        }
+    }
+
+    #[test]
+    fn a_phrase_must_hold_for_every_sample() {
+        let samples = vec![
+            "alpha ROOT LOGIN ON tty1".to_string(),
+            "beta SOMETHING ELSE ENTIRELY".to_string(),
+        ];
+        // "ROOT LOGIN ON" is in the first and not the second, so it cannot be
+        // the discriminator for this cluster.
+        assert!(longest_common_phrase(&samples).is_none_or(|p| !p.contains("ROOT LOGIN")));
+    }
+
+    #[test]
+    fn timestamps_are_not_phrases() {
+        // Shared text that is only a clock would match nothing tomorrow.
+        let samples = vec![
+            "2026-03-16 02:25:58 alpha".to_string(),
+            "2026-03-16 02:25:58 beta".to_string(),
+        ];
+        assert!(longest_common_phrase(&samples).is_none_or(|p| !p.contains("2026")));
+    }
+
+    /// The regression that mattered: a detector with no positive predicate is
+    /// rejected by the pack compiler, so a draft carrying one reaches the
+    /// operator as an error they cannot edit their way out of. Whatever
+    /// derive_detectors and the phrase fallback do, what a drafting path emits
+    /// must always be something the compiler accepts.
+    ///
+    /// This is asserted on the shape both paths build rather than on one of
+    /// them, because fixing only the heuristic route left the AI Copilot
+    /// button producing exactly the same broken pack.
+    #[test]
+    fn a_draft_always_has_a_usable_detector() {
+        let cases: Vec<Vec<String>> = vec![
+            root_login_samples(),
+            // No shared phrase at all: every sample is different.
+            vec!["alpha one".into(), "beta two".into(), "gamma three".into()],
+            // Shared text that is only a timestamp.
+            vec![
+                "2026-03-16 02:25:58 a".into(),
+                "2026-03-16 02:25:58 b".into(),
+            ],
+            vec!["single sample with nothing else".into()],
+        ];
+        for samples in cases {
+            let mut detect = derive_detectors(&samples);
+            if detect.is_empty() {
+                if let Some(phrase) = longest_common_phrase(&samples) {
+                    detect.push(phrase);
+                }
+            }
+            let contains_all = if detect.is_empty() {
+                vec![DETECTOR_PLACEHOLDER.to_string()]
+            } else {
+                detect
+            };
+            assert!(
+                !contains_all.is_empty(),
+                "a drafting path would emit an empty detector for {samples:?}"
+            );
+            assert!(
+                contains_all
+                    .iter()
+                    .all(|literal| !literal.trim().is_empty()),
+                "a blank literal is an empty detector wearing a hat: {contains_all:?}"
+            );
+        }
+    }
+
+    /// The cluster from the console that drafted a pack claiming none of its
+    /// own fixtures: two Linux root logins and one malformed Apache request,
+    /// merged by shape. Nothing is common to all three because they are not
+    /// the same source, so the draft must cover the majority format and report
+    /// the rest as unclaimed -- and its fixtures must come from what it claims.
+    #[test]
+    fn a_mixed_cluster_drafts_for_its_majority() {
+        let samples = vec![
+            "Feb 24 09:02:33 combo  -- root[2107]: ROOT LOGIN ON tty1".to_string(),
+            "211.144.162.173 - - [05/Feb/2005:08:16:59 -0500] \"GET /\" 501 1002 \"-\" \"-\""
+                .to_string(),
+            "Jul  7 08:06:15 combo  -- root[2421]: ROOT LOGIN ON tty2".to_string(),
+        ];
+        let derived = derive_detector_for(&samples);
+
+        assert!(
+            !derived.literals.is_empty()
+                && derived.literals.iter().all(|l| l != DETECTOR_PLACEHOLDER),
+            "expected a real discriminator, got {:?}",
+            derived.literals
+        );
+        assert_eq!(
+            derived.claimed.len(),
+            2,
+            "the two root logins, not the Apache line"
+        );
+        // The invariant that makes "does not claim its own fixture" impossible.
+        for sample in &derived.claimed {
+            assert!(
+                derived.literals.iter().all(|l| sample.contains(l)),
+                "{sample:?} is claimed but does not contain {:?}",
+                derived.literals
+            );
+        }
+        assert!(
+            !derived
+                .claimed
+                .iter()
+                .any(|s| s.contains("211.144.162.173")),
+            "the Apache line is a different source and must not be claimed"
+        );
+    }
+
+    #[test]
+    fn a_single_agreeing_sample_is_not_a_majority() {
+        // Three unrelated lines: no two agree, so there is no format to draft
+        // for and the placeholder is the honest answer.
+        let samples = vec![
+            "alpha one".to_string(),
+            "beta two".to_string(),
+            "gamma three".to_string(),
+        ];
+        let derived = derive_detector_for(&samples);
+        assert_eq!(derived.literals, vec![DETECTOR_PLACEHOLDER.to_string()]);
+        assert!(derived.claimed.is_empty());
+    }
+
+    #[test]
+    fn a_clean_cluster_still_claims_everything() {
+        let derived = derive_detector_for(&root_login_samples());
+        assert_eq!(derived.claimed.len(), 3);
+        assert!(derived.literals.iter().all(|l| l != DETECTOR_PLACEHOLDER));
+    }
+
+    #[test]
+    fn placeholder_matches_no_realistic_line() {
+        for sample in root_login_samples() {
+            assert!(!sample.contains(DETECTOR_PLACEHOLDER));
+        }
+    }
+}
